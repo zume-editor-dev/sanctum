@@ -245,7 +245,7 @@ fn add_pcap_findings(report: &mut Report, sum: &pcap::PcapSummary) {
             "note",
             "info",
             "capture",
-            format!("pcap capture ({})", pcap::link_type_name(sum.link_type)),
+            format!("capture ({})", pcap::link_type_name(sum.link_type)),
         )
         .detail(format!(
             "{} packets, {} hosts, {} services{}",
@@ -365,19 +365,23 @@ fn run_file_analysis(args: &Args, path: &str) -> i32 {
     }
     report.findings.push(strings);
 
-    // If it is a classic pcap, summarize its endpoints and services too.
-    if a.kind == "pcap capture" {
+    // If it is a capture (classic pcap or pcapng), summarize endpoints/services.
+    if a.kind == "pcap capture" || a.kind == "pcapng capture" {
+        let ng = a.kind == "pcapng capture";
         match read_capped(path, PCAP_READ_CAP) {
-            Ok(bytes) => match pcap::parse_pcap(&bytes, PCAP_MAX_PACKETS) {
-                Ok(sum) => add_pcap_findings(&mut report, &sum),
-                Err(e) => report.warnings.push(format!("pcap parse: {e}")),
-            },
-            Err(e) => report.warnings.push(format!("pcap read: {e}")),
+            Ok(bytes) => {
+                let parsed = if ng {
+                    pcap::parse_pcapng(&bytes, PCAP_MAX_PACKETS)
+                } else {
+                    pcap::parse_pcap(&bytes, PCAP_MAX_PACKETS)
+                };
+                match parsed {
+                    Ok(sum) => add_pcap_findings(&mut report, &sum),
+                    Err(e) => report.warnings.push(format!("capture parse: {e}")),
+                }
+            }
+            Err(e) => report.warnings.push(format!("capture read: {e}")),
         }
-    } else if a.kind == "pcapng capture" {
-        report
-            .warnings
-            .push("pcapng captures are not parsed yet (classic pcap only)".to_string());
     }
 
     report.finished = timefmt::iso8601_now();

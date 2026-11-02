@@ -17,11 +17,42 @@ pub struct PcapSummary {
     pub truncated: bool,
 }
 
+fn u16r(b: &[u8], le: bool) -> u16 {
+    if le {
+        u16::from_le_bytes([b[0], b[1]])
+    } else {
+        u16::from_be_bytes([b[0], b[1]])
+    }
+}
 fn u32r(b: &[u8], le: bool) -> u32 {
     if le {
         u32::from_le_bytes([b[0], b[1], b[2], b[3]])
     } else {
         u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    }
+}
+
+/// Sort the accumulated counters and build the summary.
+fn summarize(
+    hosts: HashMap<IpAddr, u64>,
+    services: HashMap<(&'static str, u16), u64>,
+    packets: u64,
+    link_type: u32,
+    truncated: bool,
+) -> PcapSummary {
+    let mut host_vec: Vec<(IpAddr, u64)> = hosts.into_iter().collect();
+    host_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut svc_vec: Vec<(&'static str, u16, u64)> = services
+        .into_iter()
+        .map(|((p, port), n)| (p, port, n))
+        .collect();
+    svc_vec.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(&b.1)));
+    PcapSummary {
+        link_type,
+        packets,
+        hosts: host_vec,
+        services: svc_vec,
+        truncated,
     }
 }
 
@@ -150,21 +181,81 @@ pub fn parse_pcap(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, String>
         }
     }
 
-    let mut host_vec: Vec<(IpAddr, u64)> = hosts.into_iter().collect();
-    host_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let mut svc_vec: Vec<(&'static str, u16, u64)> = services
-        .into_iter()
-        .map(|((p, port), n)| (p, port, n))
-        .collect();
-    svc_vec.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(&b.1)));
+    Ok(summarize(hosts, services, packets, link_type, truncated))
+}
 
-    Ok(PcapSummary {
-        link_type,
-        packets,
-        hosts: host_vec,
-        services: svc_vec,
-        truncated,
-    })
+/// Parse a pcapng capture (SHB / IDB / EPB / SPB), summarizing up to
+/// `max_packets` packets. The byte order is set by each Section Header Block;
+/// other block types are skipped.
+pub fn parse_pcapng(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, String> {
+    if bytes.len() < 12 || bytes[0..4] != [0x0a, 0x0d, 0x0d, 0x0a] {
+        return Err("not a pcapng capture (no Section Header Block)".to_string());
+    }
+    let mut le = match bytes[8..12] {
+        [0x1a, 0x2b, 0x3c, 0x4d] => false,
+        [0x4d, 0x3c, 0x2b, 0x1a] => true,
+        _ => return Err("bad pcapng byte-order magic".to_string()),
+    };
+
+    let mut interfaces: Vec<u16> = Vec::new(); // link type per interface index
+    let mut hosts: HashMap<IpAddr, u64> = HashMap::new();
+    let mut services: HashMap<(&'static str, u16), u64> = HashMap::new();
+    let mut packets = 0u64;
+    let mut truncated = false;
+
+    let mut pos = 0usize;
+    while pos + 12 <= bytes.len() {
+        let is_shb = bytes[pos..pos + 4] == [0x0a, 0x0d, 0x0d, 0x0a]; // endian-invariant
+        if is_shb {
+            le = match bytes[pos + 8..pos + 12] {
+                [0x1a, 0x2b, 0x3c, 0x4d] => false,
+                [0x4d, 0x3c, 0x2b, 0x1a] => true,
+                _ => return Err("bad pcapng byte-order magic".to_string()),
+            };
+        }
+        let btype = u32r(&bytes[pos..pos + 4], le);
+        let total = u32r(&bytes[pos + 4..pos + 8], le) as usize;
+        if total < 12 || pos + total > bytes.len() {
+            if pos + total > bytes.len() {
+                truncated = true;
+            }
+            break;
+        }
+        let body = &bytes[pos + 8..pos + total - 4];
+        if !is_shb {
+            match btype {
+                0x01 => {
+                    // Interface Description Block: link type is a u16 at body[0..2].
+                    interfaces.push(if body.len() >= 2 { u16r(body, le) } else { 0 });
+                }
+                // Enhanced Packet Block.
+                0x06 if body.len() >= 20 => {
+                    let iface = u32r(&body[0..4], le) as usize;
+                    let caplen = u32r(&body[12..16], le) as usize;
+                    if 20 + caplen <= body.len() {
+                        let lt = *interfaces.get(iface).unwrap_or(&0) as u32;
+                        decode_packet(&body[20..20 + caplen], lt, &mut hosts, &mut services);
+                        packets += 1;
+                    }
+                }
+                // Simple Packet Block: captured data is body[4..].
+                0x03 if body.len() >= 4 => {
+                    let lt = *interfaces.first().unwrap_or(&0) as u32;
+                    decode_packet(&body[4..], lt, &mut hosts, &mut services);
+                    packets += 1;
+                }
+                _ => {}
+            }
+        }
+        pos += total;
+        if packets >= max_packets {
+            truncated = true;
+            break;
+        }
+    }
+
+    let link_type = *interfaces.first().unwrap_or(&0) as u32;
+    Ok(summarize(hosts, services, packets, link_type, truncated))
 }
 
 /// A human-readable name for a link type (pcap "network" field).
@@ -235,7 +326,82 @@ mod tests {
     #[test]
     fn rejects_non_pcap() {
         assert!(parse_pcap(b"not a pcap file at all!!", 1000).is_err());
+        // parse_pcap does not accept pcapng; parse_pcapng does.
         assert!(parse_pcap(&[0x0a, 0x0d, 0x0d, 0x0a, 0, 0, 0, 0], 1000).is_err());
-        // pcapng
+    }
+
+    /// The Ethernet/IPv4/TCP packet used by the pcapng test
+    /// (10.0.0.1:12345 -> 10.0.0.2:80), 54 bytes.
+    fn eth_ipv4_tcp() -> Vec<u8> {
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&[0u8; 12]); // dst+src mac
+        pkt.extend_from_slice(&[0x08, 0x00]); // ethertype IPv4
+        pkt.push(0x45);
+        pkt.push(0x00);
+        pkt.extend_from_slice(&40u16.to_be_bytes());
+        pkt.extend_from_slice(&[0u8; 4]); // id, flags/frag
+        pkt.push(64);
+        pkt.push(6); // TCP
+        pkt.extend_from_slice(&0u16.to_be_bytes()); // checksum
+        pkt.extend_from_slice(&[10, 0, 0, 1]);
+        pkt.extend_from_slice(&[10, 0, 0, 2]);
+        pkt.extend_from_slice(&12345u16.to_be_bytes());
+        pkt.extend_from_slice(&80u16.to_be_bytes());
+        pkt.extend_from_slice(&[0u8; 16]);
+        pkt
+    }
+
+    fn synthetic_pcapng() -> Vec<u8> {
+        let mut v = Vec::new();
+        // Section Header Block (little-endian).
+        let shb_total = 28u32;
+        v.extend_from_slice(&0x0a0d_0d0au32.to_le_bytes());
+        v.extend_from_slice(&shb_total.to_le_bytes());
+        v.extend_from_slice(&[0x4d, 0x3c, 0x2b, 0x1a]); // byte-order magic (LE)
+        v.extend_from_slice(&1u16.to_le_bytes()); // major
+        v.extend_from_slice(&0u16.to_le_bytes()); // minor
+        v.extend_from_slice(&(-1i64).to_le_bytes()); // section length
+        v.extend_from_slice(&shb_total.to_le_bytes());
+        // Interface Description Block (link type EN10MB).
+        let idb_total = 20u32;
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&idb_total.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // linktype
+        v.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        v.extend_from_slice(&65535u32.to_le_bytes()); // snaplen
+        v.extend_from_slice(&idb_total.to_le_bytes());
+        // Enhanced Packet Block.
+        let pkt = eth_ipv4_tcp();
+        let mut data = pkt.clone();
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        let epb_total = (8 + 20 + data.len() + 4) as u32;
+        v.extend_from_slice(&6u32.to_le_bytes());
+        v.extend_from_slice(&epb_total.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // interface id
+        v.extend_from_slice(&0u32.to_le_bytes()); // ts high
+        v.extend_from_slice(&0u32.to_le_bytes()); // ts low
+        v.extend_from_slice(&(pkt.len() as u32).to_le_bytes()); // captured len
+        v.extend_from_slice(&(pkt.len() as u32).to_le_bytes()); // original len
+        v.extend_from_slice(&data);
+        v.extend_from_slice(&epb_total.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn parses_a_pcapng() {
+        let s = parse_pcapng(&synthetic_pcapng(), 1000).unwrap();
+        assert_eq!(s.link_type, 1);
+        assert_eq!(s.packets, 1);
+        assert!(s.hosts.iter().any(|(ip, _)| ip.to_string() == "10.0.0.1"));
+        assert!(s.hosts.iter().any(|(ip, _)| ip.to_string() == "10.0.0.2"));
+        assert_eq!(s.services, vec![("tcp", 80u16, 1u64)]);
+        assert!(!s.truncated);
+    }
+
+    #[test]
+    fn pcapng_rejects_non_pcapng() {
+        assert!(parse_pcapng(b"\xd4\xc3\xb2\xa1 not pcapng", 1000).is_err());
     }
 }
