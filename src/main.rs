@@ -20,6 +20,7 @@ mod result;
 mod scope;
 mod t0;
 mod timefmt;
+mod tls;
 
 use std::fs::File;
 use std::io::Read;
@@ -280,6 +281,12 @@ fn add_pcap_findings(report: &mut Report, sum: &pcap::PcapSummary) {
             Finding::new("credential", "high", "capture", "Plaintext credential")
                 .detail(cred.clone()),
         );
+    }
+    // TLS server names (SNI) seen in ClientHello messages.
+    for host in sum.sni.iter().take(PCAP_MAX_ROWS) {
+        report
+            .findings
+            .push(Finding::new("note", "info", host.clone(), "TLS SNI").detail(host.clone()));
     }
 }
 

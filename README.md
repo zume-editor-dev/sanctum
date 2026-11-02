@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.6)
+## What it does (v0.7)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -38,11 +38,15 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   Ethernet (incl. stacked **VLAN / QinQ**) / **MPLS** / raw / Linux-SLL, IPv4 /
   IPv6 (**extension headers followed**), TCP / UDP, and **IP-in-IP / GRE**
   tunnels — as host and service findings alongside the file's hashes.
-- **Tier T0 — plaintext credentials** (v0.6): recovers credentials that cross a
-  capture in the clear — **HTTP Basic auth**, **FTP / POP3** `USER` / `PASS`,
-  web form password fields, **SMTP AUTH PLAIN** — as high-severity findings.
-  A reminder of why plaintext protocols are a problem; for authorized analysis
-  of a capture you hold.
+- **Tier T0 — plaintext credentials**: recovers credentials that cross a capture
+  in the clear — **HTTP Basic** and **Digest** auth, **FTP / POP3** `USER` /
+  `PASS`, **IMAP** `LOGIN`, web form password fields, **SMTP AUTH PLAIN**, and
+  **Telnet** plaintext sessions — as high-severity findings. A reminder of why
+  plaintext protocols are a problem; for authorized analysis of a capture you
+  hold.
+- **Tier T0 — TLS SNI** (v0.7): extracts the server names (**SNI**) from TLS
+  ClientHello messages, so you can see which hosts a capture connected to even
+  when the rest of the session is encrypted.
 - Emits **result format v1** JSON that the editor lists and can act on.
 
 Heavier network capability (authenticated checks, templated probes) is out of

@@ -14,9 +14,12 @@ pub fn scan(payload: &[u8], _dport: u16, out: &mut Vec<String>) {
         return;
     }
     http_basic(payload, out);
+    http_digest(payload, out);
     smtp_auth_plain(payload, out);
     user_pass_lines(payload, out);
+    imap_login(payload, out);
     form_fields(payload, out);
+    telnet(payload, out);
 }
 
 fn push(out: &mut Vec<String>, s: String) {
@@ -159,6 +162,134 @@ fn form_fields(payload: &[u8], out: &mut Vec<String>) {
     }
 }
 
+fn take_line(hay: &[u8], start: usize) -> &[u8] {
+    take_until(hay, start, b"\r\n")
+}
+
+fn quoted_value(hay: &[u8], key: &[u8]) -> Option<String> {
+    let i = find_ci(hay, key)?;
+    let mut p = i + key.len();
+    if hay.get(p) == Some(&b'"') {
+        p += 1;
+        Some(String::from_utf8_lossy(take_until(hay, p, b"\"")).to_string())
+    } else {
+        Some(String::from_utf8_lossy(take_until(hay, p, b", \r\n")).to_string())
+    }
+}
+
+fn http_digest(payload: &[u8], out: &mut Vec<String>) {
+    const MARK: &[u8] = b"authorization: digest ";
+    if let Some(i) = find_ci(payload, MARK) {
+        let value = take_line(payload, i + MARK.len());
+        let user = quoted_value(value, b"username=");
+        let realm = quoted_value(value, b"realm=");
+        if user.is_some() || realm.is_some() {
+            // The password is not sent (Digest sends a hash), but the username
+            // and realm are, and the response hash can be cracked offline.
+            push(
+                out,
+                format!(
+                    "HTTP Digest auth: username={} realm={}",
+                    user.unwrap_or_default(),
+                    realm.unwrap_or_default()
+                ),
+            );
+        }
+    }
+}
+
+/// Quote-aware IMAP argument split (double-quoted strings may contain spaces);
+/// returns at most the first two arguments (username, password).
+fn imap_args(rest: &[u8]) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut i = 0;
+    while i < rest.len() && args.len() < 2 {
+        while i < rest.len() && rest[i] == b' ' {
+            i += 1;
+        }
+        if i >= rest.len() {
+            break;
+        }
+        if rest[i] == b'"' {
+            i += 1;
+            let start = i;
+            while i < rest.len() && rest[i] != b'"' {
+                i += 1;
+            }
+            args.push(String::from_utf8_lossy(&rest[start..i]).to_string());
+            if i < rest.len() {
+                i += 1; // closing quote
+            }
+        } else {
+            let start = i;
+            while i < rest.len() && rest[i] != b' ' {
+                i += 1;
+            }
+            args.push(String::from_utf8_lossy(&rest[start..i]).to_string());
+        }
+    }
+    args
+}
+
+fn imap_login(payload: &[u8], out: &mut Vec<String>) {
+    for raw in payload.split(|&b| b == b'\n') {
+        let mut line = raw;
+        while matches!(line.last(), Some(&b'\r') | Some(&b' ')) {
+            line = &line[..line.len() - 1];
+        }
+        // Find the "LOGIN" keyword as the first or second whitespace token,
+        // then split its arguments quote-aware.
+        let mut i = 0;
+        let mut tok_idx = 0;
+        while i < line.len() {
+            while i < line.len() && line[i] == b' ' {
+                i += 1;
+            }
+            let start = i;
+            while i < line.len() && line[i] != b' ' {
+                i += 1;
+            }
+            if line[start..i].eq_ignore_ascii_case(b"login") {
+                if tok_idx <= 1 {
+                    let args = imap_args(&line[i..]);
+                    if args.len() >= 2 {
+                        push(out, format!("IMAP LOGIN: {} / {}", args[0], args[1]));
+                    }
+                }
+                break;
+            }
+            tok_idx += 1;
+            if tok_idx > 1 {
+                break;
+            }
+        }
+    }
+}
+
+fn telnet(payload: &[u8], out: &mut Vec<String>) {
+    // Detect a Telnet IAC command (0xFF followed by a command byte).
+    let is_telnet = payload
+        .windows(2)
+        .any(|w| w[0] == 0xFF && (0xF0..=0xFE).contains(&w[1]));
+    if !is_telnet {
+        return;
+    }
+    let text: String = payload
+        .iter()
+        .filter(|&&b| (0x20..0x7f).contains(&b))
+        .map(|&b| b as char)
+        .collect();
+    let low = text.to_ascii_lowercase();
+    if low.contains("login:") || low.contains("password") || low.contains("username:") {
+        push(
+            out,
+            "Telnet plaintext session (login/password prompt in the clear)".to_string(),
+        );
+    } else {
+        push(out, "Telnet plaintext session detected".to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +348,38 @@ mod tests {
             &mut out,
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn http_digest_auth() {
+        let mut out = Vec::new();
+        scan(
+            b"GET /x HTTP/1.1\r\nAuthorization: Digest username=\"alice\", realm=\"test\", nonce=\"n\", response=\"abc\"\r\n\r\n",
+            80,
+            &mut out,
+        );
+        assert!(out
+            .iter()
+            .any(|s| s == "HTTP Digest auth: username=alice realm=test"));
+    }
+
+    #[test]
+    fn imap_login_clear() {
+        let mut out = Vec::new();
+        scan(b"a1 LOGIN bob s3cret\r\n", 143, &mut out);
+        assert!(out.iter().any(|s| s == "IMAP LOGIN: bob / s3cret"));
+        let mut out2 = Vec::new();
+        scan(b"a2 LOGIN \"u@x\" \"p p\"\r\n", 143, &mut out2);
+        assert!(out2.iter().any(|s| s == "IMAP LOGIN: u@x / p p"));
+    }
+
+    #[test]
+    fn telnet_session() {
+        let mut out = Vec::new();
+        // IAC WILL ECHO, IAC DO SUPPRESS-GO-AHEAD, then a login prompt.
+        scan(b"\xff\xfb\x01\xff\xfd\x03login: ", 23, &mut out);
+        assert!(out
+            .iter()
+            .any(|s| s.starts_with("Telnet plaintext session")));
     }
 }

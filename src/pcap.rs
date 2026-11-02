@@ -17,7 +17,22 @@ pub struct PcapSummary {
     pub services: Vec<(&'static str, u16, u64)>,
     /// Plaintext credentials recovered from packet payloads (deduplicated).
     pub creds: Vec<String>,
+    /// TLS server names (SNI) seen in ClientHello messages (deduplicated).
+    pub sni: Vec<String>,
     pub truncated: bool,
+}
+
+/// Accumulators threaded through packet decoding for payload-derived artifacts.
+#[derive(Default)]
+struct Extract {
+    creds: Vec<String>,
+    sni: Vec<String>,
+}
+
+fn push_uniq(out: &mut Vec<String>, s: String, cap: usize) {
+    if out.len() < cap && !s.is_empty() && !out.contains(&s) {
+        out.push(s);
+    }
 }
 
 fn u16r(b: &[u8], le: bool) -> u16 {
@@ -39,7 +54,7 @@ fn u32r(b: &[u8], le: bool) -> u32 {
 fn summarize(
     hosts: HashMap<IpAddr, u64>,
     services: HashMap<(&'static str, u16), u64>,
-    creds: Vec<String>,
+    ex: Extract,
     packets: u64,
     link_type: u32,
     truncated: bool,
@@ -56,7 +71,8 @@ fn summarize(
         packets,
         hosts: host_vec,
         services: svc_vec,
-        creds,
+        creds: ex.creds,
+        sni: ex.sni,
         truncated,
     }
 }
@@ -125,7 +141,7 @@ fn decode_ip(
     depth: u32,
     hosts: &mut HashMap<IpAddr, u64>,
     services: &mut HashMap<(&'static str, u16), u64>,
-    creds: &mut Vec<String>,
+    ex: &mut Extract,
 ) {
     if depth > 3 || ip.is_empty() {
         return;
@@ -215,7 +231,11 @@ fn decode_ip(
             *services.entry(("tcp", dport)).or_insert(0) += 1;
             let doff = ((l4[12] >> 4) as usize) * 4;
             if doff >= 20 && l4.len() >= doff {
-                crate::creds::scan(&l4[doff..], dport, creds);
+                let payload = &l4[doff..];
+                crate::creds::scan(payload, dport, &mut ex.creds);
+                if let Some(host) = crate::tls::client_hello_sni(payload) {
+                    push_uniq(&mut ex.sni, host, 200);
+                }
             }
         }
         17 => {
@@ -225,9 +245,9 @@ fn decode_ip(
             }
             let dport = be16(&l4[2..4]);
             *services.entry(("udp", dport)).or_insert(0) += 1;
-            crate::creds::scan(&l4[8..], dport, creds);
+            crate::creds::scan(&l4[8..], dport, &mut ex.creds);
         }
-        4 | 41 => decode_ip(l4, depth + 1, hosts, services, creds), // IP-in-IP / 6in4
+        4 | 41 => decode_ip(l4, depth + 1, hosts, services, ex), // IP-in-IP / 6in4
         47 => {
             // GRE: skip the (variable) header, then the inner IP by protocol.
             if l4.len() < 4 {
@@ -246,7 +266,7 @@ fn decode_ip(
                 hlen += 4; // sequence present
             }
             if l4.len() >= hlen && matches!(gre_proto, 0x0800 | 0x86DD) {
-                decode_ip(&l4[hlen..], depth + 1, hosts, services, creds);
+                decode_ip(&l4[hlen..], depth + 1, hosts, services, ex);
             }
         }
         _ => {}
@@ -259,10 +279,10 @@ fn decode_packet(
     link_type: u32,
     hosts: &mut HashMap<IpAddr, u64>,
     services: &mut HashMap<(&'static str, u16), u64>,
-    creds: &mut Vec<String>,
+    ex: &mut Extract,
 ) {
     if let Some(ip) = l2_to_ip(pkt, link_type) {
-        decode_ip(ip, 0, hosts, services, creds);
+        decode_ip(ip, 0, hosts, services, ex);
     }
 }
 
@@ -280,7 +300,7 @@ pub fn parse_pcap(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, String>
 
     let mut hosts: HashMap<IpAddr, u64> = HashMap::new();
     let mut services: HashMap<(&'static str, u16), u64> = HashMap::new();
-    let mut creds: Vec<String> = Vec::new();
+    let mut ex = Extract::default();
     let mut packets = 0u64;
     let mut truncated = false;
 
@@ -299,7 +319,7 @@ pub fn parse_pcap(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, String>
             link_type,
             &mut hosts,
             &mut services,
-            &mut creds,
+            &mut ex,
         );
         pos += incl_len;
         packets += 1;
@@ -310,7 +330,7 @@ pub fn parse_pcap(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, String>
     }
 
     Ok(summarize(
-        hosts, services, creds, packets, link_type, truncated,
+        hosts, services, ex, packets, link_type, truncated,
     ))
 }
 
@@ -330,7 +350,7 @@ pub fn parse_pcapng(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, Strin
     let mut interfaces: Vec<u16> = Vec::new(); // link type per interface index
     let mut hosts: HashMap<IpAddr, u64> = HashMap::new();
     let mut services: HashMap<(&'static str, u16), u64> = HashMap::new();
-    let mut creds: Vec<String> = Vec::new();
+    let mut ex = Extract::default();
     let mut packets = 0u64;
     let mut truncated = false;
 
@@ -370,7 +390,7 @@ pub fn parse_pcapng(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, Strin
                             lt,
                             &mut hosts,
                             &mut services,
-                            &mut creds,
+                            &mut ex,
                         );
                         packets += 1;
                     }
@@ -378,7 +398,7 @@ pub fn parse_pcapng(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, Strin
                 // Simple Packet Block: captured data is body[4..].
                 0x03 if body.len() >= 4 => {
                     let lt = *interfaces.first().unwrap_or(&0) as u32;
-                    decode_packet(&body[4..], lt, &mut hosts, &mut services, &mut creds);
+                    decode_packet(&body[4..], lt, &mut hosts, &mut services, &mut ex);
                     packets += 1;
                 }
                 _ => {}
@@ -393,7 +413,7 @@ pub fn parse_pcapng(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, Strin
 
     let link_type = *interfaces.first().unwrap_or(&0) as u32;
     Ok(summarize(
-        hosts, services, creds, packets, link_type, truncated,
+        hosts, services, ex, packets, link_type, truncated,
     ))
 }
 
