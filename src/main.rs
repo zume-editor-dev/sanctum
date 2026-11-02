@@ -173,15 +173,19 @@ fn run() -> i32 {
             } else {
                 format!("open {port}/tcp ({name})")
             };
-            report
-                .findings
-                .push(Finding::new("service", "low", target_label(ip, port), title));
+            report.findings.push(Finding::new(
+                "service",
+                "low",
+                target_label(ip, port),
+                title,
+            ));
         }
     }
     if parsed.hosts.len() > 1 {
-        report
-            .warnings
-            .push(format!("scanned {} host(s), {live} responded", parsed.hosts.len()));
+        report.warnings.push(format!(
+            "scanned {} host(s), {live} responded",
+            parsed.hosts.len()
+        ));
     }
 
     report.finished = timefmt::iso8601_now();

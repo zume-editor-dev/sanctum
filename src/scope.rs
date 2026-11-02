@@ -4,10 +4,9 @@
 
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 
+#[derive(Debug)]
 pub struct Scope {
-    /// The scope string as the user entered it (echoed into the result).
-    pub echo: String,
-    /// The resolved target hosts.
+    /// The resolved target hosts (the scope is the blast-radius boundary).
     pub hosts: Vec<IpAddr>,
 }
 
@@ -20,10 +19,13 @@ pub fn parse_scope(input: &str, max_hosts: usize) -> Result<Scope, String> {
 
     // A URL: take the authority's host.
     if let Some(pos) = echo.find("://") {
-        let rest = &echo[pos + 3..];
-        let authority = rest.split('/').next().unwrap_or(rest);
-        let host = authority.rsplit('@').next().unwrap_or(authority);
-        return host_to_scope(strip_port(host), echo);
+        let host = {
+            let rest = &echo[pos + 3..];
+            let authority = rest.split('/').next().unwrap_or(rest);
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            strip_port(host).to_string()
+        };
+        return host_to_scope(&host);
     }
 
     // An IPv4 CIDR: a.b.c.d/bits.
@@ -47,20 +49,21 @@ pub fn parse_scope(input: &str, max_hosts: usize) -> Result<Scope, String> {
             for i in 0..count as u32 {
                 hosts.push(IpAddr::V4(Ipv4Addr::from(network + i)));
             }
-            return Ok(Scope { echo, hosts });
+            return Ok(Scope { hosts });
         }
         // Not an IPv4 CIDR: fall through (treated as a host below).
     }
 
-    host_to_scope(strip_port(&echo), echo)
+    let host = strip_port(&echo).to_string();
+    host_to_scope(&host)
 }
 
-fn host_to_scope(host: &str, echo: String) -> Result<Scope, String> {
+fn host_to_scope(host: &str) -> Result<Scope, String> {
     if host.is_empty() {
         return Err("no host in scope".to_string());
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(Scope { echo, hosts: vec![ip] });
+        return Ok(Scope { hosts: vec![ip] });
     }
     // A hostname: resolve it (port 0 is a placeholder for resolution only).
     let iter = (host, 0u16)
@@ -76,7 +79,7 @@ fn host_to_scope(host: &str, echo: String) -> Result<Scope, String> {
     if hosts.is_empty() {
         return Err(format!("no addresses for '{host}'"));
     }
-    Ok(Scope { echo, hosts })
+    Ok(Scope { hosts })
 }
 
 fn mask(bits: u32) -> u32 {

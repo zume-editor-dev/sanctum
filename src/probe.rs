@@ -103,7 +103,10 @@ mod tests {
     #[test]
     fn parses_ports_and_ranges() {
         assert_eq!(parse_ports("22, 80,443", 1024).unwrap(), vec![22, 80, 443]);
-        assert_eq!(parse_ports("8000-8003", 1024).unwrap(), vec![8000, 8001, 8002, 8003]);
+        assert_eq!(
+            parse_ports("8000-8003", 1024).unwrap(),
+            vec![8000, 8001, 8002, 8003]
+        );
         assert_eq!(parse_ports("443-443", 1024).unwrap(), vec![443]);
         // Reversed ranges are normalized; duplicates are dropped.
         assert_eq!(parse_ports("82-80,80", 1024).unwrap(), vec![80, 81, 82]);

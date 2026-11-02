@@ -149,13 +149,19 @@ mod tests {
 
     #[test]
     fn serializes_a_report() {
-        let mut r = Report::new("192.0.2.0/30".to_string(), "2026-11-03T00:00:00Z".to_string());
-        r.finished = "2026-11-03T00:00:01Z".to_string();
-        r.findings.push(
-            Finding::new("host", "info", "192.0.2.1", "Host up").detail("1 open port(s)"),
+        let mut r = Report::new(
+            "192.0.2.0/30".to_string(),
+            "2026-11-03T00:00:00Z".to_string(),
         );
+        r.finished = "2026-11-03T00:00:01Z".to_string();
         r.findings
-            .push(Finding::new("service", "low", "192.0.2.1:22", "open 22/tcp (ssh)"));
+            .push(Finding::new("host", "info", "192.0.2.1", "Host up").detail("1 open port(s)"));
+        r.findings.push(Finding::new(
+            "service",
+            "low",
+            "192.0.2.1:22",
+            "open 22/tcp (ssh)",
+        ));
         r.warnings.push("4 host(s), 1 responded".to_string());
         let json = r.to_json();
         assert!(json.starts_with("{\"schema\":1,\"tool\":\"sanctum\","));
