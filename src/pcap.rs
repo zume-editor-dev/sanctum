@@ -1,8 +1,9 @@
-//! Tier T0 (offline): a minimal classic-pcap reader. Given a `.pcap` capture
-//! (not pcapng), it summarizes the endpoints and destination services seen -
-//! Ethernet / raw / Linux-SLL link layers, IPv4 / IPv6, TCP / UDP. Purely
-//! passive: it parses a file you already hold and touches no network. pcapng is
-//! not parsed yet (a later increment).
+//! Tier T0 (offline): a capture reader for classic `.pcap` and `.pcapng`. It
+//! summarizes the endpoints and destination services seen - Ethernet (incl.
+//! stacked VLAN / QinQ) / MPLS / raw / Linux-SLL link layers, IPv4 / IPv6
+//! (extension headers followed), TCP / UDP, and IP-in-IP / GRE tunnels - and
+//! recovers plaintext credentials from payloads (see creds.rs). Purely passive:
+//! it parses a file you already hold and touches no network.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -14,6 +15,8 @@ pub struct PcapSummary {
     pub hosts: Vec<(IpAddr, u64)>,
     /// (proto, destination port, packet count), most-seen first.
     pub services: Vec<(&'static str, u16, u64)>,
+    /// Plaintext credentials recovered from packet payloads (deduplicated).
+    pub creds: Vec<String>,
     pub truncated: bool,
 }
 
@@ -36,6 +39,7 @@ fn u32r(b: &[u8], le: bool) -> u32 {
 fn summarize(
     hosts: HashMap<IpAddr, u64>,
     services: HashMap<(&'static str, u16), u64>,
+    creds: Vec<String>,
     packets: u64,
     link_type: u32,
     truncated: bool,
@@ -52,52 +56,82 @@ fn summarize(
         packets,
         hosts: host_vec,
         services: svc_vec,
+        creds,
         truncated,
     }
 }
 
-/// Decode one packet's L3/L4 and bump the counters. `link_type` is the pcap
-/// global header's network field.
-fn decode_packet(
-    pkt: &[u8],
-    link_type: u32,
-    hosts: &mut HashMap<IpAddr, u64>,
-    services: &mut HashMap<(&'static str, u16), u64>,
-) {
-    // Advance to the IP header per link layer.
-    let ip = match link_type {
+fn be16(b: &[u8]) -> u16 {
+    u16::from_be_bytes([b[0], b[1]])
+}
+
+/// Peel the link layer (Ethernet incl. stacked VLAN / QinQ, MPLS, raw IP,
+/// Linux-SLL) and return the IP packet slice.
+fn l2_to_ip(pkt: &[u8], link_type: u32) -> Option<&[u8]> {
+    match link_type {
         1 => {
-            // Ethernet: 14-byte header, optional 802.1Q VLAN tag.
             if pkt.len() < 14 {
-                return;
+                return None;
             }
-            let mut off = 12;
-            let mut ethertype = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
-            off = 14;
-            if ethertype == 0x8100 && pkt.len() >= 18 {
-                ethertype = u16::from_be_bytes([pkt[16], pkt[17]]);
-                off = 18;
+            let mut off = 14usize;
+            let mut ethertype = be16(&pkt[12..14]);
+            // Unwrap stacked VLAN tags: 802.1Q (0x8100) and 802.1ad / QinQ (0x88a8).
+            let mut guard = 0;
+            while (ethertype == 0x8100 || ethertype == 0x88a8) && pkt.len() >= off + 4 && guard < 4
+            {
+                ethertype = be16(&pkt[off + 2..off + 4]);
+                off += 4;
+                guard += 1;
             }
             match ethertype {
-                0x0800 | 0x86DD => &pkt[off..],
-                _ => return,
+                0x0800 | 0x86DD => Some(&pkt[off..]),
+                0x8847 | 0x8848 => mpls_to_ip(&pkt[off..]), // MPLS unicast / multicast
+                _ => None,
             }
         }
-        101 => pkt, // DLT_RAW: IP directly
-        113 => {
-            // DLT_LINUX_SLL: 16-byte header
-            if pkt.len() < 16 {
-                return;
-            }
-            &pkt[16..]
+        101 => Some(pkt),                             // DLT_RAW
+        113 => (pkt.len() >= 16).then(|| &pkt[16..]), // DLT_LINUX_SLL
+        _ => None,
+    }
+}
+
+/// Skip an MPLS label stack to the inner IP packet (bottom-of-stack bit).
+fn mpls_to_ip(data: &[u8]) -> Option<&[u8]> {
+    let mut off = 0usize;
+    let mut guard = 0;
+    loop {
+        if data.len() < off + 4 || guard > 16 {
+            return None;
         }
-        _ => return,
-    };
-    if ip.is_empty() {
+        let bottom = data[off + 2] & 0x01;
+        off += 4;
+        guard += 1;
+        if bottom == 1 {
+            break;
+        }
+    }
+    let rest = data.get(off..)?;
+    match rest.first().map(|b| b >> 4) {
+        Some(4) | Some(6) => Some(rest),
+        _ => None,
+    }
+}
+
+/// Decode an IP packet (following IPv6 extension headers and IP-in-IP / GRE
+/// tunnels up to a small depth), counting hosts and services and scanning L4
+/// payloads for plaintext credentials.
+fn decode_ip(
+    ip: &[u8],
+    depth: u32,
+    hosts: &mut HashMap<IpAddr, u64>,
+    services: &mut HashMap<(&'static str, u16), u64>,
+    creds: &mut Vec<String>,
+) {
+    if depth > 3 || ip.is_empty() {
         return;
     }
     let version = ip[0] >> 4;
-    let (src, dst, proto, l4) = if version == 4 {
+    let (src, dst, proto, l4): (IpAddr, IpAddr, u8, &[u8]) = if version == 4 {
         if ip.len() < 20 {
             return;
         }
@@ -105,9 +139,12 @@ fn decode_packet(
         if ihl < 20 || ip.len() < ihl {
             return;
         }
-        let src = IpAddr::V4(Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]));
-        let dst = IpAddr::V4(Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]));
-        (src, dst, ip[9], &ip[ihl..])
+        (
+            IpAddr::V4(Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15])),
+            IpAddr::V4(Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19])),
+            ip[9],
+            &ip[ihl..],
+        )
     } else if version == 6 {
         if ip.len() < 40 {
             return;
@@ -116,11 +153,50 @@ fn decode_packet(
         let mut d = [0u8; 16];
         s.copy_from_slice(&ip[8..24]);
         d.copy_from_slice(&ip[24..40]);
+        // Follow IPv6 extension headers to the real upper-layer protocol.
+        let mut nh = ip[6];
+        let mut off = 40usize;
+        let mut guard = 0;
+        loop {
+            let ext_len = match nh {
+                0 | 43 | 60 => {
+                    // Hop-by-Hop, Routing, Destination Options: 8 * (len+1) bytes.
+                    if ip.len() < off + 2 {
+                        return;
+                    }
+                    (ip[off + 1] as usize + 1) * 8
+                }
+                51 => {
+                    // Authentication Header: 4 * (len+2) bytes.
+                    if ip.len() < off + 2 {
+                        return;
+                    }
+                    (ip[off + 1] as usize + 2) * 4
+                }
+                44 => {
+                    // Fragment header (fixed 8 bytes); only offset 0 has the L4.
+                    if ip.len() < off + 8 {
+                        return;
+                    }
+                    if (be16(&ip[off + 2..off + 4]) >> 3) != 0 {
+                        return; // a later fragment: no usable L4 here
+                    }
+                    8
+                }
+                _ => break,
+            };
+            nh = ip[off];
+            off += ext_len;
+            guard += 1;
+            if off > ip.len() || guard > 16 {
+                return;
+            }
+        }
         (
             IpAddr::V6(Ipv6Addr::from(s)),
             IpAddr::V6(Ipv6Addr::from(d)),
-            ip[6], // next header (extension headers not followed in v0.4)
-            &ip[40..],
+            nh,
+            &ip[off..],
         )
     } else {
         return;
@@ -129,14 +205,64 @@ fn decode_packet(
     *hosts.entry(src).or_insert(0) += 1;
     *hosts.entry(dst).or_insert(0) += 1;
 
-    let proto_name = match proto {
-        6 => "tcp",
-        17 => "udp",
-        _ => return, // only TCP/UDP services are summarized
-    };
-    if l4.len() >= 4 {
-        let dport = u16::from_be_bytes([l4[2], l4[3]]);
-        *services.entry((proto_name, dport)).or_insert(0) += 1;
+    match proto {
+        6 => {
+            // TCP
+            if l4.len() < 20 {
+                return;
+            }
+            let dport = be16(&l4[2..4]);
+            *services.entry(("tcp", dport)).or_insert(0) += 1;
+            let doff = ((l4[12] >> 4) as usize) * 4;
+            if doff >= 20 && l4.len() >= doff {
+                crate::creds::scan(&l4[doff..], dport, creds);
+            }
+        }
+        17 => {
+            // UDP
+            if l4.len() < 8 {
+                return;
+            }
+            let dport = be16(&l4[2..4]);
+            *services.entry(("udp", dport)).or_insert(0) += 1;
+            crate::creds::scan(&l4[8..], dport, creds);
+        }
+        4 | 41 => decode_ip(l4, depth + 1, hosts, services, creds), // IP-in-IP / 6in4
+        47 => {
+            // GRE: skip the (variable) header, then the inner IP by protocol.
+            if l4.len() < 4 {
+                return;
+            }
+            let flags = l4[0];
+            let gre_proto = be16(&l4[2..4]);
+            let mut hlen = 4usize;
+            if flags & 0x80 != 0 {
+                hlen += 4; // checksum present
+            }
+            if flags & 0x20 != 0 {
+                hlen += 4; // key present
+            }
+            if flags & 0x10 != 0 {
+                hlen += 4; // sequence present
+            }
+            if l4.len() >= hlen && matches!(gre_proto, 0x0800 | 0x86DD) {
+                decode_ip(&l4[hlen..], depth + 1, hosts, services, creds);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Decode one captured packet from its link layer down.
+fn decode_packet(
+    pkt: &[u8],
+    link_type: u32,
+    hosts: &mut HashMap<IpAddr, u64>,
+    services: &mut HashMap<(&'static str, u16), u64>,
+    creds: &mut Vec<String>,
+) {
+    if let Some(ip) = l2_to_ip(pkt, link_type) {
+        decode_ip(ip, 0, hosts, services, creds);
     }
 }
 
@@ -154,6 +280,7 @@ pub fn parse_pcap(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, String>
 
     let mut hosts: HashMap<IpAddr, u64> = HashMap::new();
     let mut services: HashMap<(&'static str, u16), u64> = HashMap::new();
+    let mut creds: Vec<String> = Vec::new();
     let mut packets = 0u64;
     let mut truncated = false;
 
@@ -172,6 +299,7 @@ pub fn parse_pcap(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, String>
             link_type,
             &mut hosts,
             &mut services,
+            &mut creds,
         );
         pos += incl_len;
         packets += 1;
@@ -181,7 +309,9 @@ pub fn parse_pcap(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, String>
         }
     }
 
-    Ok(summarize(hosts, services, packets, link_type, truncated))
+    Ok(summarize(
+        hosts, services, creds, packets, link_type, truncated,
+    ))
 }
 
 /// Parse a pcapng capture (SHB / IDB / EPB / SPB), summarizing up to
@@ -200,6 +330,7 @@ pub fn parse_pcapng(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, Strin
     let mut interfaces: Vec<u16> = Vec::new(); // link type per interface index
     let mut hosts: HashMap<IpAddr, u64> = HashMap::new();
     let mut services: HashMap<(&'static str, u16), u64> = HashMap::new();
+    let mut creds: Vec<String> = Vec::new();
     let mut packets = 0u64;
     let mut truncated = false;
 
@@ -234,14 +365,20 @@ pub fn parse_pcapng(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, Strin
                     let caplen = u32r(&body[12..16], le) as usize;
                     if 20 + caplen <= body.len() {
                         let lt = *interfaces.get(iface).unwrap_or(&0) as u32;
-                        decode_packet(&body[20..20 + caplen], lt, &mut hosts, &mut services);
+                        decode_packet(
+                            &body[20..20 + caplen],
+                            lt,
+                            &mut hosts,
+                            &mut services,
+                            &mut creds,
+                        );
                         packets += 1;
                     }
                 }
                 // Simple Packet Block: captured data is body[4..].
                 0x03 if body.len() >= 4 => {
                     let lt = *interfaces.first().unwrap_or(&0) as u32;
-                    decode_packet(&body[4..], lt, &mut hosts, &mut services);
+                    decode_packet(&body[4..], lt, &mut hosts, &mut services, &mut creds);
                     packets += 1;
                 }
                 _ => {}
@@ -255,7 +392,9 @@ pub fn parse_pcapng(bytes: &[u8], max_packets: u64) -> Result<PcapSummary, Strin
     }
 
     let link_type = *interfaces.first().unwrap_or(&0) as u32;
-    Ok(summarize(hosts, services, packets, link_type, truncated))
+    Ok(summarize(
+        hosts, services, creds, packets, link_type, truncated,
+    ))
 }
 
 /// A human-readable name for a link type (pcap "network" field).
@@ -403,5 +542,78 @@ mod tests {
     #[test]
     fn pcapng_rejects_non_pcapng() {
         assert!(parse_pcapng(b"\xd4\xc3\xb2\xa1 not pcapng", 1000).is_err());
+    }
+
+    /// Wrap a single link-layer frame in a one-packet little-endian classic pcap.
+    fn classic_pcap(frame: &[u8], link_type: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0xd4, 0xc3, 0xb2, 0xa1]);
+        v.extend_from_slice(&2u16.to_le_bytes());
+        v.extend_from_slice(&4u16.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&65535u32.to_le_bytes());
+        v.extend_from_slice(&link_type.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        v.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        v.extend_from_slice(frame);
+        v
+    }
+
+    fn tcp_header(dport: u16) -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(&40000u16.to_be_bytes()); // sport
+        t.extend_from_slice(&dport.to_be_bytes());
+        t.extend_from_slice(&[0u8; 8]); // seq, ack
+        t.push(0x50); // data offset 5
+        t.push(0x18); // flags
+        t.extend_from_slice(&[0u8; 6]); // window, checksum, urgent
+        t
+    }
+
+    #[test]
+    fn follows_ipv6_extension_headers() {
+        // Ethernet + IPv6 (next = Hop-by-Hop) + Hop-by-Hop (next = TCP) + TCP:443.
+        let tcp = tcp_header(443);
+        let mut frame = vec![0u8; 12];
+        frame.extend_from_slice(&[0x86, 0xDD]); // IPv6
+        frame.extend_from_slice(&[0x60, 0, 0, 0]); // version/tc/flow
+        frame.extend_from_slice(&((8 + tcp.len()) as u16).to_be_bytes()); // payload length
+        frame.push(0); // next header = Hop-by-Hop
+        frame.push(64); // hop limit
+        frame.extend_from_slice(&[1u8; 16]); // src
+        frame.extend_from_slice(&[2u8; 16]); // dst
+        frame.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0]); // HbH: next = TCP, len 0
+        frame.extend_from_slice(&tcp);
+        let s = parse_pcap(&classic_pcap(&frame, 1), 100).unwrap();
+        assert!(
+            s.services.contains(&("tcp", 443, 1)),
+            "the IPv6 extension header must be followed to reach TCP/443"
+        );
+    }
+
+    #[test]
+    fn unwraps_qinq_vlan() {
+        // Ethernet + 802.1ad (QinQ) + 802.1Q + IPv4 + TCP:80.
+        let tcp = tcp_header(80);
+        let mut ip = vec![0x45, 0u8];
+        ip.extend_from_slice(&((20 + tcp.len()) as u16).to_be_bytes());
+        ip.extend_from_slice(&[0, 0, 0, 0, 64, 6, 0, 0]);
+        ip.extend_from_slice(&[10, 0, 0, 1, 10, 0, 0, 2]);
+        ip.extend_from_slice(&tcp);
+        let mut frame = vec![0u8; 12];
+        frame.extend_from_slice(&[0x88, 0xa8]); // outer 802.1ad
+        frame.extend_from_slice(&[0x00, 0x0a]);
+        frame.extend_from_slice(&[0x81, 0x00]); // inner 802.1Q
+        frame.extend_from_slice(&[0x00, 0x14]);
+        frame.extend_from_slice(&[0x08, 0x00]); // IPv4
+        frame.extend_from_slice(&ip);
+        let s = parse_pcap(&classic_pcap(&frame, 1), 100).unwrap();
+        assert!(
+            s.services.contains(&("tcp", 80, 1)),
+            "stacked VLAN tags must be unwrapped"
+        );
     }
 }

@@ -12,6 +12,7 @@
 //! test may be illegal. The operator is responsible for staying in scope.
 
 mod audit;
+mod creds;
 mod hash;
 mod pcap;
 mod probe;
@@ -271,6 +272,13 @@ fn add_pcap_findings(report: &mut Report, sum: &pcap::PcapSummary) {
         report.findings.push(
             Finding::new("service", "low", format!("{port}/{proto}"), title)
                 .detail(format!("{n} packets")),
+        );
+    }
+    // Plaintext credentials recovered from payloads - high severity.
+    for cred in sum.creds.iter().take(PCAP_MAX_ROWS) {
+        report.findings.push(
+            Finding::new("credential", "high", "capture", "Plaintext credential")
+                .detail(cred.clone()),
         );
     }
 }

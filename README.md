@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.5)
+## What it does (v0.6)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -33,10 +33,16 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   and extract **printable strings** — in one streaming pass. Purely passive: it
   reads a file you point it at and sends nothing anywhere, so it needs no
   `--i-am-authorized`.
-- **Tier T0 — capture summary** (v0.4 pcap, v0.5 **pcapng**): when `--file` is a
-  `.pcap` or `.pcapng` capture, it also summarizes the **endpoints and
-  destination services** seen (Ethernet / raw / Linux-SLL, IPv4 / IPv6, TCP /
-  UDP) — host and service findings alongside the file's hashes.
+- **Tier T0 — capture summary** (`.pcap` and `.pcapng`): when `--file` is a
+  capture, it also summarizes the **endpoints and destination services** seen —
+  Ethernet (incl. stacked **VLAN / QinQ**) / **MPLS** / raw / Linux-SLL, IPv4 /
+  IPv6 (**extension headers followed**), TCP / UDP, and **IP-in-IP / GRE**
+  tunnels — as host and service findings alongside the file's hashes.
+- **Tier T0 — plaintext credentials** (v0.6): recovers credentials that cross a
+  capture in the clear — **HTTP Basic auth**, **FTP / POP3** `USER` / `PASS`,
+  web form password fields, **SMTP AUTH PLAIN** — as high-severity findings.
+  A reminder of why plaintext protocols are a problem; for authorized analysis
+  of a capture you hold.
 - Emits **result format v1** JSON that the editor lists and can act on.
 
 Heavier network capability (authenticated checks, templated probes) is out of
