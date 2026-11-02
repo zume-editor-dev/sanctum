@@ -11,6 +11,7 @@
 //! Running recon against systems you do not own or have explicit permission to
 //! test may be illegal. The operator is responsible for staying in scope.
 
+mod aes;
 mod audit;
 mod creds;
 mod hash;
@@ -18,6 +19,7 @@ mod kerberos;
 mod ntlm;
 mod pcap;
 mod probe;
+mod quic;
 mod result;
 mod scope;
 mod t0;

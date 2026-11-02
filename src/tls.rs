@@ -7,14 +7,19 @@ fn be16(b: &[u8]) -> usize {
     ((b[0] as usize) << 8) | b[1] as usize
 }
 
-/// The SNI host name from a TLS ClientHello in `payload`, if present.
+/// The SNI host name from a TLS ClientHello wrapped in a TLS record (TCP).
 pub fn client_hello_sni(payload: &[u8]) -> Option<String> {
     // TLS record: content type 22 (handshake), version (2), length (2).
     if payload.len() < 5 || payload[0] != 22 {
         return None;
     }
+    sni_from_handshake(payload.get(5..)?)
+}
+
+/// The SNI host name from a raw TLS handshake message (no record layer) - this
+/// is what QUIC carries in its CRYPTO stream.
+pub fn sni_from_handshake(hs: &[u8]) -> Option<String> {
     // Handshake: type 1 (ClientHello) + 3-byte length, then the body.
-    let hs = payload.get(5..)?;
     if hs.len() < 4 || hs[0] != 1 {
         return None;
     }

@@ -329,7 +329,15 @@ impl Sha256 {
             self.state[i] = self.state[i].wrapping_add(*hi);
         }
     }
-    pub fn finalize(mut self) -> String {
+    pub fn finalize(self) -> String {
+        let mut out = String::with_capacity(64);
+        for b in self.finalize_bytes() {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    }
+    /// The raw 32-byte digest.
+    pub fn finalize_bytes(mut self) -> [u8; 32] {
         let bit_len = self.len.wrapping_mul(8);
         let mut pad = vec![0x80u8];
         while (self.len + pad.len() as u64) % 64 != 56 {
@@ -337,12 +345,77 @@ impl Sha256 {
         }
         pad.extend_from_slice(&bit_len.to_be_bytes());
         self.update(&pad);
-        let mut out = String::with_capacity(64);
-        for s in self.state {
-            out.push_str(&format!("{s:08x}"));
+        let mut out = [0u8; 32];
+        for (i, s) in self.state.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&s.to_be_bytes());
         }
         out
     }
+}
+
+// ---- HMAC-SHA256 and HKDF (RFC 2104 / 5869), for QUIC key derivation --------
+pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize_bytes()
+}
+
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&sha256_bytes(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0u8; 64];
+    let mut opad = [0u8; 64];
+    for i in 0..64 {
+        ipad[i] = k[i] ^ 0x36;
+        opad[i] = k[i] ^ 0x5c;
+    }
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(msg);
+    let inner = inner.finalize_bytes();
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(&inner);
+    outer.finalize_bytes()
+}
+
+pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
+    hmac_sha256(salt, ikm)
+}
+
+pub fn hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut t: Vec<u8> = Vec::new();
+    let mut counter = 1u8;
+    while out.len() < len {
+        let mut msg = t.clone();
+        msg.extend_from_slice(info);
+        msg.push(counter);
+        t = hmac_sha256(prk, &msg).to_vec();
+        out.extend_from_slice(&t);
+        counter = counter.wrapping_add(1);
+        if counter == 0 {
+            break;
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+/// TLS 1.3 / QUIC HKDF-Expand-Label with the "tls13 " prefix.
+pub fn hkdf_expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> Vec<u8> {
+    let full = format!("tls13 {label}");
+    let mut info = Vec::new();
+    info.extend_from_slice(&(len as u16).to_be_bytes());
+    info.push(full.len() as u8);
+    info.extend_from_slice(full.as_bytes());
+    info.push(context.len() as u8);
+    info.extend_from_slice(context);
+    hkdf_expand(secret, &info, len)
 }
 
 #[cfg(test)]
@@ -397,5 +470,36 @@ mod tests {
         h.update(&data[..37]);
         h.update(&data[37..]);
         assert_eq!(h.finalize(), one);
+    }
+
+    fn hx(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn hmac_sha256_rfc4231() {
+        // RFC 4231 test case 1.
+        let mac = hmac_sha256(&[0x0b; 20], b"Hi There");
+        assert_eq!(
+            hx(&mac),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn hkdf_rfc5869_a1() {
+        let ikm = [0x0b; 22];
+        let salt: Vec<u8> = (0..=0x0cu8).collect();
+        let info: Vec<u8> = (0xf0u8..=0xf9).collect();
+        let prk = hkdf_extract(&salt, &ikm);
+        assert_eq!(
+            hx(&prk),
+            "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+        );
+        let okm = hkdf_expand(&prk, &info, 42);
+        assert_eq!(
+            hx(&okm),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
     }
 }

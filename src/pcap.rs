@@ -253,6 +253,10 @@ fn decode_ip(
             *services.entry(("udp", dport)).or_insert(0) += 1;
             crate::creds::scan(&l4[8..], dport, &mut ex.creds);
             crate::kerberos::scan(&l4[8..], &mut ex.auth); // Kerberos is often UDP/88
+                                                           // QUIC Initial packets (usually UDP/443) carry a cleartext-recoverable SNI.
+            if let Some(host) = crate::quic::initial_sni(&l4[8..]) {
+                push_uniq(&mut ex.sni, host, 200);
+            }
         }
         4 | 41 => decode_ip(l4, depth + 1, hosts, services, ex), // IP-in-IP / 6in4
         47 => {
