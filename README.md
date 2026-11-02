@@ -18,16 +18,23 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.1)
+## What it does (v0.2)
 
 - **Tier T1 — active recon** (opt-in, scope-limited): TCP **connect** host
   discovery and port enumeration. Connect scans only — no raw sockets, no SYN
   scanning, no exploitation, no credential attacks.
+- **Banner grab / passive fingerprint** (v0.2, on by default; `--no-banner` to
+  skip): reads the greeting a service volunteers on connect (SSH, SMTP, FTP,
+  POP3, IMAP, …) or, for an HTTP port, the `Server:` header from one HEAD
+  request, and records it as the finding's `detail`. TLS ports are skipped (no
+  handshake). No protocol-specific exploit is ever sent.
 - Emits **result format v1** JSON: a host that responds and each open port
   become findings the editor lists and can act on.
 
 Heavier capability (authenticated checks, templated probes) is out of scope for
-v0.1, and exploitation / payload generation / C2 are **not** goals of this tool.
+now, and exploitation / payload generation / C2 are **not** goals of this tool.
+Deeper offline / passive analysis (pcap and artifact inspection, tier T0) is a
+planned, separate increment.
 
 ## Install
 
@@ -49,6 +56,7 @@ sanctum --scope <SCOPE> --i-am-authorized [--json <PATH>] [--ports <SPEC>]
 - `--json <PATH>` — write the result JSON there (Zume passes `{out}`); otherwise
   it goes to stdout.
 - `--ports "22,80,443,8000-8010"` — defaults to a small common set.
+- `--no-banner` — skip banner grabbing (report open ports only).
 - `--timeout-ms` (default 800), `--max-hosts` (default 1024), `--max-ports`
   (default 1024), `--audit <PATH>` (default `$SANCTUM_AUDIT` or `./sanctum-audit.log`).
 
@@ -83,14 +91,14 @@ A single JSON object written to `--json` (`{out}`):
 ```json
 {
   "schema": 1,
-  "tool": "sanctum", "version": "0.1.0",
+  "tool": "sanctum", "version": "0.2.0",
   "started": "2026-11-03T09:00:00Z", "finished": "2026-11-03T09:00:12Z",
   "scope": "192.0.2.0/28",
   "findings": [
     { "kind": "host", "severity": "info", "target": "192.0.2.10",
       "title": "Host up", "detail": "2 open port(s)", "evidence_path": "", "address": "" },
     { "kind": "service", "severity": "low", "target": "192.0.2.10:22",
-      "title": "open 22/tcp (ssh)", "detail": "", "evidence_path": "", "address": "" }
+      "title": "open 22/tcp (ssh)", "detail": "SSH-2.0-OpenSSH_9.6p1", "evidence_path": "", "address": "" }
   ],
   "warnings": []
 }
@@ -106,7 +114,8 @@ Zume — `sanctum` is one reference implementation.
 - **Scope is the boundary** — only hosts inside the parsed scope are probed, and
   a scope larger than `--max-hosts` is refused.
 - **Conservative** — sequential connects with a short timeout; not an aggressive
-  scan, no mass targeting.
+  scan, no mass targeting. Banner grabbing is one extra short read per open port
+  (a single HEAD request for HTTP), and sends no protocol-specific exploit.
 - **Audit log** — every run and every refusal is appended to the audit file.
 
 ## License

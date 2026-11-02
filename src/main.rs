@@ -35,6 +35,7 @@ struct Args {
     timeout_ms: u64,
     max_hosts: usize,
     max_ports: usize,
+    banner: bool,
     help: bool,
 }
 
@@ -49,6 +50,7 @@ impl Default for Args {
             timeout_ms: DEFAULT_TIMEOUT_MS,
             max_hosts: DEFAULT_MAX_HOSTS,
             max_ports: DEFAULT_MAX_PORTS,
+            banner: true,
             help: false,
         }
     }
@@ -173,12 +175,15 @@ fn run() -> i32 {
             } else {
                 format!("open {port}/tcp ({name})")
             };
-            report.findings.push(Finding::new(
-                "service",
-                "low",
-                target_label(ip, port),
-                title,
-            ));
+            let mut finding = Finding::new("service", "low", target_label(ip, port), title);
+            // Banner grab (v0.2): record the greeting / Server header the service
+            // volunteers, as the finding detail.
+            if args.banner {
+                if let Some(banner) = probe::grab_banner(*ip, port, timeout) {
+                    finding = finding.detail(banner);
+                }
+            }
+            report.findings.push(finding);
         }
     }
     if parsed.hosts.len() > 1 {
@@ -254,6 +259,7 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "invalid --max-ports".to_string())?;
             }
+            "--no-banner" => args.banner = false,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -291,6 +297,7 @@ OPTIONS:
     --timeout-ms <N>     Per-connection timeout in ms (default: 800).
     --max-hosts <N>      Refuse a scope larger than this many hosts (default: 1024).
     --max-ports <N>      Cap the port list (default: 1024).
+    --no-banner          Do not read service banners (just report open ports).
     -h, --help           Show this help.
 
 OUTPUT:
