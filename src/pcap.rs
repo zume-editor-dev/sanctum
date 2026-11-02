@@ -21,6 +21,9 @@ pub struct PcapSummary {
     pub sni: Vec<String>,
     /// NTLM / Kerberos authentication material seen (deduplicated).
     pub auth: Vec<String>,
+    /// Protocol-level session facts (SMB dialect / SMB1 / tree connect, LDAP
+    /// SASL mechanism) - informational context (deduplicated).
+    pub notes: Vec<String>,
     pub truncated: bool,
 }
 
@@ -30,6 +33,7 @@ struct Extract {
     creds: Vec<String>,
     sni: Vec<String>,
     auth: Vec<String>,
+    notes: Vec<String>,
 }
 
 fn push_uniq(out: &mut Vec<String>, s: String, cap: usize) {
@@ -77,6 +81,7 @@ fn summarize(
         creds: ex.creds,
         sni: ex.sni,
         auth: ex.auth,
+        notes: ex.notes,
         truncated,
     }
 }
@@ -239,6 +244,10 @@ fn decode_ip(
                 crate::creds::scan(payload, dport, &mut ex.creds);
                 crate::ntlm::scan(payload, &mut ex.auth);
                 crate::kerberos::scan(payload, &mut ex.auth);
+                // SMB / LDAP session context (the NTLM / Kerberos blobs they
+                // carry are already recovered by the scanners above).
+                crate::smb::scan(payload, &mut ex.notes);
+                crate::ldap::scan(payload, &mut ex.creds, &mut ex.notes);
                 if let Some(host) = crate::tls::client_hello_sni(payload) {
                     push_uniq(&mut ex.sni, host, 200);
                 }

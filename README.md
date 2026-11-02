@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.9)
+## What it does (v0.10)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -55,6 +55,12 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   server challenge, NetNTLMv1/v2 presence; raw or base64 in HTTP) and
   **Kerberos** AS-REQ / AS-REP / TGS messages (principal and realm) — as
   high-severity findings.
+- **Tier T0 — SMB2 / LDAP** (v0.10): reads the **LDAP** BindRequest — a *simple*
+  bind's DN and **cleartext password** (a high-severity credential), a SASL
+  bind's mechanism — and summarizes **SMB1/SMB2** session context: SMB1 (legacy,
+  insecure) in use, the negotiated SMB2 dialect, that a SESSION_SETUP (where NTLM
+  / Kerberos authentication happens — the token is recovered above) was seen, and
+  the **TREE_CONNECT** share paths (`\\server\share`) accessed.
 - Emits **result format v1** JSON that the editor lists and can act on.
 
 Heavier network capability (authenticated checks, templated probes) is out of

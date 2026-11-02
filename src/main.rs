@@ -16,12 +16,14 @@ mod audit;
 mod creds;
 mod hash;
 mod kerberos;
+mod ldap;
 mod ntlm;
 mod pcap;
 mod probe;
 mod quic;
 mod result;
 mod scope;
+mod smb;
 mod t0;
 mod timefmt;
 mod tls;
@@ -293,6 +295,12 @@ fn add_pcap_findings(report: &mut Report, sum: &pcap::PcapSummary) {
             Finding::new("credential", "high", "capture", "Authentication material")
                 .detail(a.clone()),
         );
+    }
+    // Protocol session facts (SMB dialect / SMB1 / tree connect, LDAP SASL).
+    for note in sum.notes.iter().take(PCAP_MAX_ROWS) {
+        report
+            .findings
+            .push(Finding::new("note", "info", "capture", "Session context").detail(note.clone()));
     }
     // TLS server names (SNI) seen in ClientHello messages.
     for host in sum.sni.iter().take(PCAP_MAX_ROWS) {
