@@ -14,6 +14,8 @@
 mod audit;
 mod creds;
 mod hash;
+mod kerberos;
+mod ntlm;
 mod pcap;
 mod probe;
 mod result;
@@ -21,6 +23,7 @@ mod scope;
 mod t0;
 mod timefmt;
 mod tls;
+mod util;
 
 use std::fs::File;
 use std::io::Read;
@@ -280,6 +283,13 @@ fn add_pcap_findings(report: &mut Report, sum: &pcap::PcapSummary) {
         report.findings.push(
             Finding::new("credential", "high", "capture", "Plaintext credential")
                 .detail(cred.clone()),
+        );
+    }
+    // NTLM / Kerberos authentication material - high severity.
+    for a in sum.auth.iter().take(PCAP_MAX_ROWS) {
+        report.findings.push(
+            Finding::new("credential", "high", "capture", "Authentication material")
+                .detail(a.clone()),
         );
     }
     // TLS server names (SNI) seen in ClientHello messages.

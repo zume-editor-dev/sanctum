@@ -19,6 +19,8 @@ pub struct PcapSummary {
     pub creds: Vec<String>,
     /// TLS server names (SNI) seen in ClientHello messages (deduplicated).
     pub sni: Vec<String>,
+    /// NTLM / Kerberos authentication material seen (deduplicated).
+    pub auth: Vec<String>,
     pub truncated: bool,
 }
 
@@ -27,6 +29,7 @@ pub struct PcapSummary {
 struct Extract {
     creds: Vec<String>,
     sni: Vec<String>,
+    auth: Vec<String>,
 }
 
 fn push_uniq(out: &mut Vec<String>, s: String, cap: usize) {
@@ -73,6 +76,7 @@ fn summarize(
         services: svc_vec,
         creds: ex.creds,
         sni: ex.sni,
+        auth: ex.auth,
         truncated,
     }
 }
@@ -233,6 +237,8 @@ fn decode_ip(
             if doff >= 20 && l4.len() >= doff {
                 let payload = &l4[doff..];
                 crate::creds::scan(payload, dport, &mut ex.creds);
+                crate::ntlm::scan(payload, &mut ex.auth);
+                crate::kerberos::scan(payload, &mut ex.auth);
                 if let Some(host) = crate::tls::client_hello_sni(payload) {
                     push_uniq(&mut ex.sni, host, 200);
                 }
@@ -246,6 +252,7 @@ fn decode_ip(
             let dport = be16(&l4[2..4]);
             *services.entry(("udp", dport)).or_insert(0) += 1;
             crate::creds::scan(&l4[8..], dport, &mut ex.creds);
+            crate::kerberos::scan(&l4[8..], &mut ex.auth); // Kerberos is often UDP/88
         }
         4 | 41 => decode_ip(l4, depth + 1, hosts, services, ex), // IP-in-IP / 6in4
         47 => {

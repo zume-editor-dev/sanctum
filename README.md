@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.7)
+## What it does (v0.8)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -44,9 +44,14 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   **Telnet** plaintext sessions — as high-severity findings. A reminder of why
   plaintext protocols are a problem; for authorized analysis of a capture you
   hold.
-- **Tier T0 — TLS SNI** (v0.7): extracts the server names (**SNI**) from TLS
-  ClientHello messages, so you can see which hosts a capture connected to even
-  when the rest of the session is encrypted.
+- **Tier T0 — TLS SNI**: extracts the server names (**SNI**) from TLS
+  ClientHello messages (TLS 1.2 and 1.3 — the SNI is cleartext in both), so you
+  can see which hosts a capture connected to even when the session is encrypted.
+- **Tier T0 — NTLM / Kerberos** (v0.8): surfaces Windows authentication
+  handshakes — **NTLMSSP** challenge/authenticate (domain \\ user, workstation,
+  server challenge, NetNTLMv1/v2 presence; raw or base64 in HTTP) and
+  **Kerberos** AS-REQ / AS-REP / TGS messages (principal and realm) — as
+  high-severity findings.
 - Emits **result format v1** JSON that the editor lists and can act on.
 
 Heavier network capability (authenticated checks, templated probes) is out of
