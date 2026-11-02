@@ -18,23 +18,26 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.2)
+## What it does (v0.3)
 
-- **Tier T1 — active recon** (opt-in, scope-limited): TCP **connect** host
-  discovery and port enumeration. Connect scans only — no raw sockets, no SYN
-  scanning, no exploitation, no credential attacks.
-- **Banner grab / passive fingerprint** (v0.2, on by default; `--no-banner` to
-  skip): reads the greeting a service volunteers on connect (SSH, SMTP, FTP,
-  POP3, IMAP, …) or, for an HTTP port, the `Server:` header from one HEAD
-  request, and records it as the finding's `detail`. TLS ports are skipped (no
-  handshake). No protocol-specific exploit is ever sent.
-- Emits **result format v1** JSON: a host that responds and each open port
-  become findings the editor lists and can act on.
+- **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
+  host discovery and port enumeration. Connect scans only — no raw sockets, no
+  SYN scanning, no exploitation, no credential attacks.
+- **Banner grab / passive fingerprint** (on by default; `--no-banner` to skip):
+  reads the greeting a service volunteers on connect (SSH, SMTP, FTP, POP3,
+  IMAP, …) or, for an HTTP port, the `Server:` header from one HEAD request, and
+  records it as the finding's `detail`. TLS ports are skipped. No
+  protocol-specific exploit is ever sent.
+- **Tier T0 — offline file analysis** (`--file`, v0.3, no network): identify the
+  file type (magic), compute **CRC32 / MD5 / SHA-1 / SHA-256**, Shannon
+  **entropy**, and extract **printable strings** — in one streaming pass. Purely
+  passive: it reads a file you point it at and sends nothing anywhere, so it
+  needs no `--i-am-authorized`.
+- Emits **result format v1** JSON that the editor lists and can act on.
 
-Heavier capability (authenticated checks, templated probes) is out of scope for
-now, and exploitation / payload generation / C2 are **not** goals of this tool.
-Deeper offline / passive analysis (pcap and artifact inspection, tier T0) is a
-planned, separate increment.
+Heavier network capability (authenticated checks, templated probes) is out of
+scope for now, and exploitation / payload generation / C2 are **not** goals.
+Offline **pcap** parsing (a further T0 increment) is planned separately.
 
 ## Install
 
@@ -68,6 +71,15 @@ sanctum --scope 192.0.2.10 --i-am-authorized
 
 # A /28 with chosen ports, result to a file (as Zume invokes it):
 sanctum --scope 192.0.2.0/28 --ports 22,80,443 --json out.json --i-am-authorized
+
+# Offline analysis of a local file (no network, no authorization needed):
+sanctum --file ./suspect.bin --json out.json
+```
+
+In Zume, configure a second analyzer for files (its `{target}` is a path):
+
+```json
+{ "analyzer_tools": "recon = sanctum --scope \"{target}\" --json \"{out}\" --i-am-authorized\nfile = sanctum --file \"{target}\" --json \"{out}\"" }
 ```
 
 ## Use it from Zume Editor

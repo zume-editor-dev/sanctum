@@ -12,9 +12,11 @@
 //! test may be illegal. The operator is responsible for staying in scope.
 
 mod audit;
+mod hash;
 mod probe;
 mod result;
 mod scope;
+mod t0;
 mod timefmt;
 
 use std::net::IpAddr;
@@ -28,6 +30,7 @@ const DEFAULT_MAX_PORTS: usize = 1024;
 
 struct Args {
     scope: Option<String>,
+    file: Option<String>,
     json_out: Option<String>,
     ports: Option<String>,
     authorized: bool,
@@ -43,6 +46,7 @@ impl Default for Args {
     fn default() -> Self {
         Args {
             scope: None,
+            file: None,
             json_out: None,
             ports: None,
             authorized: false,
@@ -74,10 +78,18 @@ fn run() -> i32 {
         print_usage();
         return 0;
     }
+    if args.scope.is_some() && args.file.is_some() {
+        eprintln!("sanctum: use --scope (network recon) or --file (offline analysis), not both");
+        return 2;
+    }
+    // Tier T0: offline analysis of a local file (no network, no authorization gate).
+    if let Some(file) = args.file.clone() {
+        return run_file_analysis(&args, &file);
+    }
     let scope_str = match &args.scope {
         Some(s) => s.clone(),
         None => {
-            eprintln!("sanctum: --scope is required");
+            eprintln!("sanctum: --scope (network recon) or --file (offline analysis) is required");
             eprintln!();
             eprint_usage();
             return 2;
@@ -212,6 +224,115 @@ fn run() -> i32 {
     0
 }
 
+/// Tier T0: analyze a local file offline (no network, no authorization gate)
+/// and report its type, hashes, entropy and strings as findings.
+fn run_file_analysis(args: &Args, path: &str) -> i32 {
+    let started = timefmt::iso8601_now();
+    let mut report = Report::new(path.to_string(), started.clone());
+    let audit = audit::audit_path(args.audit.as_deref());
+
+    let a = match t0::analyze_file(path) {
+        Ok(a) => a,
+        Err(e) => {
+            report.warnings.push(format!("cannot read file: {e}"));
+            report.finished = timefmt::iso8601_now();
+            audit::log(
+                &audit,
+                &format!(
+                    "{started} file_error file={} err={}",
+                    result::jstr(path),
+                    result::jstr(&e.to_string())
+                ),
+            );
+            write_result(&report, args);
+            eprintln!("sanctum: cannot read {path}: {e}");
+            return 2;
+        }
+    };
+    audit::log(
+        &audit,
+        &format!(
+            "{started} analyze file={} size={} sha256={}",
+            result::jstr(path),
+            a.size,
+            a.sha256
+        ),
+    );
+
+    // Summary artifact finding - its evidence_path opens the file from the panel.
+    let mut summary = Finding::new(
+        "artifact",
+        "info",
+        path.to_string(),
+        format!("{} ({} bytes)", a.kind, a.size),
+    );
+    summary.detail = format!("entropy {:.2} bits/byte", a.entropy);
+    summary.evidence_path = path.to_string();
+    report.findings.push(summary);
+
+    // Hashes - each row copies its line (hash in the detail).
+    report
+        .findings
+        .push(Finding::new("hash", "info", path.to_string(), "CRC32").detail(a.crc32));
+    report
+        .findings
+        .push(Finding::new("hash", "info", path.to_string(), "MD5").detail(a.md5));
+    report
+        .findings
+        .push(Finding::new("hash", "info", path.to_string(), "SHA-1").detail(a.sha1));
+    report
+        .findings
+        .push(Finding::new("hash", "info", path.to_string(), "SHA-256").detail(a.sha256));
+
+    if a.entropy >= 7.5 {
+        report.findings.push(
+            Finding::new("note", "medium", path.to_string(), "High entropy").detail(format!(
+                "{:.2} bits/byte - likely compressed or encrypted",
+                a.entropy
+            )),
+        );
+    }
+
+    let title = if a.strings_truncated {
+        format!(
+            "printable strings: {} (first 4 MiB scanned)",
+            a.string_count
+        )
+    } else {
+        format!("printable strings: {}", a.string_count)
+    };
+    let sample = a
+        .sample_strings
+        .iter()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let mut strings = Finding::new("artifact", "info", path.to_string(), title);
+    if !sample.is_empty() {
+        strings = strings.detail(sample);
+    }
+    report.findings.push(strings);
+
+    report.finished = timefmt::iso8601_now();
+    audit::log(
+        &audit,
+        &format!(
+            "{} file_done file={} findings={}",
+            report.finished,
+            result::jstr(path),
+            report.findings.len()
+        ),
+    );
+    eprintln!(
+        "sanctum: analyzed {path} ({} bytes), {} finding(s).",
+        a.size,
+        report.findings.len()
+    );
+    write_result(&report, args);
+    0
+}
+
 /// "ip:port", bracketing an IPv6 literal so the target is unambiguous.
 fn target_label(ip: &IpAddr, port: u16) -> String {
     match ip {
@@ -241,6 +362,7 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => args.help = true,
             "--i-am-authorized" => args.authorized = true,
             "--scope" => args.scope = Some(need_value(&mut it, "--scope")?),
+            "--file" => args.file = Some(need_value(&mut it, "--file")?),
             "--json" => args.json_out = Some(need_value(&mut it, "--json")?),
             "--ports" => args.ports = Some(need_value(&mut it, "--ports")?),
             "--audit" => args.audit = Some(need_value(&mut it, "--audit")?),
@@ -282,14 +404,21 @@ const USAGE: &str = "\
 sanctum - authorized-scope reconnaissance companion for Zume Editor
 
 USAGE:
-    sanctum --scope <SCOPE> --i-am-authorized [--json <PATH>] [--ports <SPEC>]
-            [--audit <PATH>] [--timeout-ms <N>] [--max-hosts <N>] [--max-ports <N>]
+    Network recon (tier T1):
+      sanctum --scope <SCOPE> --i-am-authorized [--json <PATH>] [--ports <SPEC>]
+              [--no-banner] [--audit <PATH>] [--timeout-ms <N>] [--max-hosts <N>]
+              [--max-ports <N>]
+    Offline file analysis (tier T0, no network):
+      sanctum --file <PATH> [--json <PATH>] [--audit <PATH>]
 
-AUTHORIZED USE ONLY. Active probing is refused without --i-am-authorized. Only
-run this against systems you own or are explicitly permitted to test.
+AUTHORIZED USE ONLY. Active probing (--scope) is refused without
+--i-am-authorized. Only run it against systems you own or are explicitly
+permitted to test. --file is passive: it reads a local file and sends nothing.
 
 OPTIONS:
     --scope <SCOPE>      An IP, an IPv4 CIDR (a.b.c.d/bits), a hostname, or a URL.
+    --file <PATH>        Analyze a local file offline: type, hashes (CRC32 / MD5 /
+                         SHA-1 / SHA-256), entropy and printable strings.
     --i-am-authorized    Confirm you are authorized to test the scope (required).
     --json <PATH>        Write the result JSON here (Zume passes {out}); else stdout.
     --ports <SPEC>       Ports: \"22,80,443,8000-8010\" (default: a common set).
