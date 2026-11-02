@@ -1,5 +1,8 @@
 # sanctum
 
+[![CI](https://github.com/zume-editor-dev/sanctum/actions/workflows/ci.yml/badge.svg)](https://github.com/zume-editor-dev/sanctum/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
 **Authorized-scope reconnaissance companion for [Zume Editor](https://smolt-stage.com/home/en/zume-editor.html).**
 
 `sanctum` runs *scoped* reconnaissance and writes its findings as a small JSON
