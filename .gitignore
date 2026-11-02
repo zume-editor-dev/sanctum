@@ -1,0 +1,3 @@
+/target
+*.log
+sanctum-audit.log

@@ -1,0 +1,24 @@
+[package]
+name = "sanctum"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "Apache-2.0"
+description = "Authorized-scope reconnaissance companion for Zume Editor: runs scoped recon and emits result-format-v1 JSON. Authorized security testing only."
+repository = "https://github.com/zume-editor-dev/sanctum"
+readme = "README.md"
+keywords = ["security", "pentest", "recon", "authorized", "zume"]
+categories = ["command-line-utilities"]
+
+# Zero third-party dependencies on purpose: the std library is enough, the build
+# is offline, and the attack surface stays minimal.
+[dependencies]
+
+[[bin]]
+name = "sanctum"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
