@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.3)
+## What it does (v0.4)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -28,16 +28,19 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   IMAP, …) or, for an HTTP port, the `Server:` header from one HEAD request, and
   records it as the finding's `detail`. TLS ports are skipped. No
   protocol-specific exploit is ever sent.
-- **Tier T0 — offline file analysis** (`--file`, v0.3, no network): identify the
-  file type (magic), compute **CRC32 / MD5 / SHA-1 / SHA-256**, Shannon
-  **entropy**, and extract **printable strings** — in one streaming pass. Purely
-  passive: it reads a file you point it at and sends nothing anywhere, so it
-  needs no `--i-am-authorized`.
+- **Tier T0 — offline file analysis** (`--file`, no network): identify the file
+  type (magic), compute **CRC32 / MD5 / SHA-1 / SHA-256**, Shannon **entropy**,
+  and extract **printable strings** — in one streaming pass. Purely passive: it
+  reads a file you point it at and sends nothing anywhere, so it needs no
+  `--i-am-authorized`.
+- **Tier T0 — pcap summary** (v0.4): when `--file` is a classic `.pcap` capture,
+  it also summarizes the **endpoints and destination services** seen
+  (Ethernet / raw / Linux-SLL, IPv4 / IPv6, TCP / UDP) — host and service
+  findings alongside the file's hashes. pcapng is not parsed yet.
 - Emits **result format v1** JSON that the editor lists and can act on.
 
 Heavier network capability (authenticated checks, templated probes) is out of
 scope for now, and exploitation / payload generation / C2 are **not** goals.
-Offline **pcap** parsing (a further T0 increment) is planned separately.
 
 ## Install
 

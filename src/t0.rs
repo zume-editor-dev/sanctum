@@ -56,6 +56,14 @@ pub fn identify(prefix: &[u8]) -> &'static str {
         "GIF image"
     } else if starts(b"%!PS") {
         "PostScript"
+    } else if starts(b"\xd4\xc3\xb2\xa1")
+        || starts(b"\xa1\xb2\xc3\xd4")
+        || starts(b"\x4d\x3c\xb2\xa1")
+        || starts(b"\xa1\xb2\x3c\x4d")
+    {
+        "pcap capture"
+    } else if starts(b"\x0a\x0d\x0d\x0a") {
+        "pcapng capture"
     } else if p.is_empty() {
         "empty"
     } else if p

@@ -13,12 +13,15 @@
 
 mod audit;
 mod hash;
+mod pcap;
 mod probe;
 mod result;
 mod scope;
 mod t0;
 mod timefmt;
 
+use std::fs::File;
+use std::io::Read;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -27,6 +30,9 @@ use result::{Finding, Report};
 const DEFAULT_TIMEOUT_MS: u64 = 800;
 const DEFAULT_MAX_HOSTS: usize = 1024;
 const DEFAULT_MAX_PORTS: usize = 1024;
+const PCAP_READ_CAP: u64 = 64 * 1024 * 1024; // bytes of a pcap read for summary
+const PCAP_MAX_PACKETS: u64 = 200_000;
+const PCAP_MAX_ROWS: usize = 50; // cap host / service findings
 
 struct Args {
     scope: Option<String>,
@@ -224,6 +230,51 @@ fn run() -> i32 {
     0
 }
 
+/// Read up to `cap` bytes of a file (bounded, for the pcap summary).
+fn read_capped(path: &str, cap: u64) -> std::io::Result<Vec<u8>> {
+    let f = File::open(path)?;
+    let mut buf = Vec::new();
+    f.take(cap).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Turn a pcap summary into findings (a note, then top hosts and services).
+fn add_pcap_findings(report: &mut Report, sum: &pcap::PcapSummary) {
+    report.findings.push(
+        Finding::new(
+            "note",
+            "info",
+            "capture",
+            format!("pcap capture ({})", pcap::link_type_name(sum.link_type)),
+        )
+        .detail(format!(
+            "{} packets, {} hosts, {} services{}",
+            sum.packets,
+            sum.hosts.len(),
+            sum.services.len(),
+            if sum.truncated { " (truncated)" } else { "" }
+        )),
+    );
+    for (ip, n) in sum.hosts.iter().take(PCAP_MAX_ROWS) {
+        report.findings.push(
+            Finding::new("host", "info", ip.to_string(), "seen in capture")
+                .detail(format!("{n} packets")),
+        );
+    }
+    for (proto, port, n) in sum.services.iter().take(PCAP_MAX_ROWS) {
+        let name = probe::service_name(*port);
+        let title = if name.is_empty() {
+            format!("{port}/{proto}")
+        } else {
+            format!("{name} ({port}/{proto})")
+        };
+        report.findings.push(
+            Finding::new("service", "low", format!("{port}/{proto}"), title)
+                .detail(format!("{n} packets")),
+        );
+    }
+}
+
 /// Tier T0: analyze a local file offline (no network, no authorization gate)
 /// and report its type, hashes, entropy and strings as findings.
 fn run_file_analysis(args: &Args, path: &str) -> i32 {
@@ -313,6 +364,21 @@ fn run_file_analysis(args: &Args, path: &str) -> i32 {
         strings = strings.detail(sample);
     }
     report.findings.push(strings);
+
+    // If it is a classic pcap, summarize its endpoints and services too.
+    if a.kind == "pcap capture" {
+        match read_capped(path, PCAP_READ_CAP) {
+            Ok(bytes) => match pcap::parse_pcap(&bytes, PCAP_MAX_PACKETS) {
+                Ok(sum) => add_pcap_findings(&mut report, &sum),
+                Err(e) => report.warnings.push(format!("pcap parse: {e}")),
+            },
+            Err(e) => report.warnings.push(format!("pcap read: {e}")),
+        }
+    } else if a.kind == "pcapng capture" {
+        report
+            .warnings
+            .push("pcapng captures are not parsed yet (classic pcap only)".to_string());
+    }
 
     report.finished = timefmt::iso8601_now();
     audit::log(
