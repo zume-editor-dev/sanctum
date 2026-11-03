@@ -361,6 +361,162 @@ pub fn crawl(
     }
 }
 
+// ---- reflected-XSS detection (ADR 0001, non-destructive) --------------------
+//
+// For each query parameter we send a benign unique marker followed by the
+// XSS-significant characters and observe whether they come back **unencoded**.
+// The marker is not a working script and nothing is executed - this detects
+// that user input is reflected without output encoding, the precondition for
+// reflected XSS. GET only, one request per parameter, rate-limited and capped.
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reflection {
+    None,
+    Encoded, // the marker came back but the '<' was encoded
+    Raw,     // the raw '<' survived next to the marker - injection is possible
+}
+
+/// A unique, alphanumeric probe marker for this process/run.
+fn marker() -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("sanctumxss{:x}", (n as u64) & 0xff_ffff_ffff)
+}
+
+/// Percent-encode a query value (everything but RFC 3986 unreserved).
+fn pct_encode(s: &str) -> String {
+    let mut o = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                o.push(b as char)
+            }
+            _ => o.push_str(&format!("%{b:02X}")),
+        }
+    }
+    o
+}
+
+/// The query parameters of a URL as (name, value) pairs (empty if none).
+pub fn query_params(url: &str) -> Vec<(String, String)> {
+    let after_q = match url.split_once('?') {
+        Some((_, q)) => q,
+        None => return Vec::new(),
+    };
+    let query = after_q.split('#').next().unwrap_or("");
+    if query.is_empty() {
+        return Vec::new();
+    }
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some((n, v)) => (n.to_string(), v.to_string()),
+            None => (p.to_string(), String::new()),
+        })
+        .collect()
+}
+
+/// Rebuild `url` with parameter `index`'s value replaced by `value`
+/// (percent-encoded). Returns the original URL if it has no such parameter.
+pub fn set_param(url: &str, index: usize, value: &str) -> String {
+    let (head, rest) = match url.split_once('?') {
+        Some(hr) => hr,
+        None => return url.to_string(),
+    };
+    let (query, frag) = match rest.split_once('#') {
+        Some((q, f)) => (q, format!("#{f}")),
+        None => (rest, String::new()),
+    };
+    let mut params: Vec<(String, String)> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some((n, v)) => (n.to_string(), v.to_string()),
+            None => (p.to_string(), String::new()),
+        })
+        .collect();
+    if index >= params.len() {
+        return url.to_string();
+    }
+    params[index].1 = pct_encode(value);
+    let rebuilt: Vec<String> = params.iter().map(|(n, v)| format!("{n}={v}")).collect();
+    format!("{head}?{}{frag}", rebuilt.join("&"))
+}
+
+/// Classify how `marker` (and the '<' sent right after it) came back in `body`.
+pub fn detect_reflection(marker: &str, body: &str) -> Reflection {
+    if body.contains(&format!("{marker}<")) {
+        Reflection::Raw
+    } else if body.contains(marker) {
+        Reflection::Encoded
+    } else {
+        Reflection::None
+    }
+}
+
+/// A finding for a parameter's reflection, if any is worth reporting.
+pub fn xss_finding(url: &str, param: &str, refl: Reflection) -> Option<Finding> {
+    match refl {
+        Reflection::Raw => Some(
+            Finding::new("web", "high", url.to_string(), "Reflected XSS candidate").detail(
+                format!("parameter `{param}` is reflected unencoded (the injected '<' survived)"),
+            ),
+        ),
+        Reflection::Encoded => Some(
+            Finding::new(
+                "web",
+                "info",
+                url.to_string(),
+                "Parameter reflected (encoded)",
+            )
+            .detail(format!("parameter `{param}` is reflected but HTML-encoded")),
+        ),
+        Reflection::None => None,
+    }
+}
+
+/// Probe the query parameters of each URL for reflected XSS. One GET per
+/// parameter (deduped by path+name across URLs), capped at `max_probes` and
+/// rate-limited by `delay`. Non-destructive.
+pub fn reflected_xss_scan(
+    urls: &[String],
+    timeout: Duration,
+    delay: Duration,
+    max_probes: usize,
+) -> Vec<Finding> {
+    let mark = marker();
+    let probe_value = format!("{mark}<>\"'");
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut probes = 0usize;
+    for url in urls {
+        let params = query_params(url);
+        for (i, (name, _)) in params.iter().enumerate() {
+            if probes >= max_probes {
+                return out;
+            }
+            let path = url.split('?').next().unwrap_or(url);
+            if !seen.insert(format!("{path}\u{1}{name}")) {
+                continue; // the same path+param, already probed
+            }
+            if probes > 0 {
+                std::thread::sleep(delay);
+            }
+            probes += 1;
+            let probe_url = set_param(url, i, &probe_value);
+            if let Ok(resp) = fetch(&probe_url, timeout) {
+                if let Some(f) = xss_finding(url, name, detect_reflection(&mark, &resp.body)) {
+                    out.push(f);
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +618,59 @@ mod tests {
         assert!(same_origin("https://ex.com/a", "https://ex.com/b"));
         assert!(!same_origin("https://ex.com/a", "http://ex.com/a"));
         assert!(!same_origin("https://ex.com/a", "https://cdn.ex.com/a"));
+    }
+
+    #[test]
+    fn parses_and_rewrites_query_params() {
+        let url = "https://ex.com/s?q=hi&page=2#frag";
+        let ps = query_params(url);
+        assert_eq!(
+            ps,
+            vec![("q".into(), "hi".into()), ("page".into(), "2".into())]
+        );
+        // Replacing q keeps page and the fragment, and percent-encodes specials.
+        assert_eq!(
+            set_param(url, 0, "a<b>\"'"),
+            "https://ex.com/s?q=a%3Cb%3E%22%27&page=2#frag"
+        );
+        assert_eq!(
+            query_params("https://ex.com/s"),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn classifies_reflection() {
+        let m = "sanctumxssDEAD";
+        assert_eq!(
+            detect_reflection(m, &format!("<p>{m}<>\"'</p>")),
+            Reflection::Raw
+        );
+        assert_eq!(
+            detect_reflection(m, &format!("<p>{m}&lt;&gt;</p>")),
+            Reflection::Encoded
+        );
+        assert_eq!(
+            detect_reflection(m, "<p>nothing here</p>"),
+            Reflection::None
+        );
+    }
+
+    #[test]
+    fn xss_finding_severity() {
+        assert_eq!(
+            xss_finding("https://ex.com/?q=1", "q", Reflection::Raw)
+                .unwrap()
+                .severity,
+            "high"
+        );
+        assert_eq!(
+            xss_finding("https://ex.com/?q=1", "q", Reflection::Encoded)
+                .unwrap()
+                .severity,
+            "info"
+        );
+        assert!(xss_finding("https://ex.com/?q=1", "q", Reflection::None).is_none());
     }
 
     #[test]

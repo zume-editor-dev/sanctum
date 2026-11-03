@@ -46,6 +46,7 @@ const DEFAULT_MAX_PORTS: usize = 1024;
 const DEFAULT_MAX_PAGES: usize = 20; // T2 crawl page cap
 const WEB_CRAWL_DEPTH: u32 = 2;
 const WEB_CRAWL_DELAY_MS: u64 = 300; // rate limit between crawl requests
+const WEB_MAX_PROBES: usize = 50; // cap on active probe requests (--active)
 const PCAP_READ_CAP: u64 = 64 * 1024 * 1024; // bytes of a pcap read for summary
 const PCAP_MAX_PACKETS: u64 = 200_000;
 const PCAP_MAX_ROWS: usize = 50; // cap host / service findings
@@ -63,6 +64,7 @@ struct Args {
     max_ports: usize,
     banner: bool,
     crawl: bool,
+    active: bool,
     max_pages: usize,
     help: bool,
 }
@@ -82,6 +84,7 @@ impl Default for Args {
             max_ports: DEFAULT_MAX_PORTS,
             banner: true,
             crawl: false,
+            active: false,
             max_pages: DEFAULT_MAX_PAGES,
             help: false,
         }
@@ -517,6 +520,9 @@ fn run_web(args: &Args, url: &str) -> i32 {
     // Web responses need more headroom than a TCP connect; honor an explicit
     // --timeout-ms but floor it so a default 800 ms does not spuriously fail.
     let timeout = Duration::from_millis(args.timeout_ms.max(5000));
+    // The URLs an active probe (--active) will target: the crawled pages, else
+    // just the given URL.
+    let mut candidates: Vec<String> = Vec::new();
     if args.crawl {
         // Bounded, same-origin, rate-limited crawl, auditing every page.
         let res = web::crawl(
@@ -540,6 +546,7 @@ fn run_web(args: &Args, url: &str) -> i32 {
                     .detail(format!("status {status}")),
             );
         }
+        candidates = res.pages.into_iter().map(|(u, _)| u).collect();
         for f in res.findings {
             report.findings.push(f);
         }
@@ -561,6 +568,24 @@ fn run_web(args: &Args, url: &str) -> i32 {
                     ),
                 );
             }
+        }
+        candidates.push(url.to_string());
+    }
+    // Active, non-destructive detection (--active): reflected-XSS probing of
+    // query parameters (ADR 0001 increment 2).
+    if args.active {
+        audit::log(
+            &audit,
+            &format!("{started} web_active url={}", result::jstr(url)),
+        );
+        let xss = web::reflected_xss_scan(
+            &candidates,
+            timeout,
+            Duration::from_millis(WEB_CRAWL_DELAY_MS),
+            WEB_MAX_PROBES,
+        );
+        for f in xss {
+            report.findings.push(f);
         }
     }
     report.finished = timefmt::iso8601_now();
@@ -624,6 +649,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--no-banner" => args.banner = false,
             "--crawl" => args.crawl = true,
+            "--active" => args.active = true,
             "--max-pages" => {
                 args.max_pages = need_value(&mut it, "--max-pages")?
                     .parse()
@@ -658,7 +684,7 @@ USAGE:
     Offline file analysis (tier T0, no network):
       sanctum --file <PATH> [--json <PATH>] [--audit <PATH>]
     Web diagnostics (tier T2, non-destructive):
-      sanctum --web <URL> --i-am-authorized [--crawl] [--max-pages <N>]
+      sanctum --web <URL> --i-am-authorized [--crawl] [--active] [--max-pages <N>]
               [--json <PATH>] [--audit <PATH>] [--timeout-ms <N>]
 
 AUTHORIZED USE ONLY. Active work (--scope, --web) is refused without
@@ -674,6 +700,9 @@ OPTIONS:
                          cookie flags, software disclosure and transport posture.
     --crawl              With --web: follow same-origin links and audit each page
                          (bounded, rate-limited; non-destructive).
+    --active             With --web: non-destructive active detection - probe
+                         query parameters for reflected XSS (benign marker, no
+                         payload executes). Rate-limited and capped.
     --max-pages <N>      Crawl page cap (default 20).
     --i-am-authorized    Confirm you are authorized to test the scope (required).
     --json <PATH>        Write the result JSON here (Zume passes {out}); else stdout.
