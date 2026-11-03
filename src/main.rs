@@ -14,6 +14,7 @@
 mod aes;
 mod audit;
 mod creds;
+mod dcerpc;
 mod hash;
 mod kerberos;
 mod ldap;

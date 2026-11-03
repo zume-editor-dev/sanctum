@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.11)
+## What it does (v0.12)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -66,6 +66,11 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   / enabled / off, v0.11), that a SESSION_SETUP (where NTLM / Kerberos
   authentication happens — the token is recovered above) was seen, and the
   **TREE_CONNECT** share paths and **CREATE** file paths (v0.11) accessed.
+- **Tier T0 — DCE/RPC** (v0.12): locates an MSRPC Bind PDU — over TCP or inside
+  an SMB named pipe — and names the bound interface, flagging the ones that
+  matter for lateral movement: **DRSUAPI** (DCSync), **SVCCTL** / task scheduler
+  (remote exec), **SPOOLSS** / **EFSRPC** (coercion), **NETLOGON**, **SAMR** /
+  **LSARPC** (enumeration).
 - Emits **result format v1** JSON that the editor lists and can act on.
 
 Heavier network capability (authenticated checks, templated probes) is out of

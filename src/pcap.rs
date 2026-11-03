@@ -248,6 +248,7 @@ fn decode_ip(
                 // carry are already recovered by the scanners above).
                 crate::smb::scan(payload, &mut ex.notes);
                 crate::ldap::scan(payload, &mut ex.creds, &mut ex.notes);
+                crate::dcerpc::scan(payload, &mut ex.notes);
                 if let Some(host) = crate::tls::client_hello_sni(payload) {
                     push_uniq(&mut ex.sni, host, 200);
                 }
