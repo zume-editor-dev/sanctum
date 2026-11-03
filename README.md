@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.13)
+## What it does (v0.14)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -76,10 +76,19 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   and reads a **RADIUS** packet — the cleartext **User-Name** and calling
   station, whether a secret-encrypted User-Password is present, and a Microsoft
   **MS-CHAP** VSA (crackable offline) — as session context and auth material.
+- **Tier T2 — web diagnostics** (`--web <URL>`, opt-in, **non-destructive**;
+  v0.14, ADR 0001): makes one HTTP(S) request to an authorized URL and audits
+  the response — missing / weak **security headers** (HSTS, CSP,
+  X-Content-Type-Options, X-Frame-Options, Referrer-Policy), **cookie flags**
+  (Secure / HttpOnly / SameSite), **software / version disclosure** (`Server`,
+  `X-Powered-By`) and the **transport posture** (plaintext HTTP). Detection
+  only; later increments add a bounded crawl and non-destructive reflected-XSS /
+  SQL-injection / open-redirect **detection**.
 - Emits **result format v1** JSON that the editor lists and can act on.
 
-Heavier network capability (authenticated checks, templated probes) is out of
-scope for now, and exploitation / payload generation / C2 are **not** goals.
+Exploitation, payload / shellcode generation, C2, data extraction (e.g. sqlmap
+`--dump`), authentication-bypass execution, WAF evasion, brute-force and DoS are
+**not** goals and are out of scope (ADR 0001).
 
 ## Detection matrix
 
@@ -110,7 +119,16 @@ the result JSON (`credential` / `auth` → `high`, `note` → `info`).
 | DCE/RPC | bound interface UUID → service (DRSUAPI / DCSync, SVCCTL / task-sched exec, SPOOLSS / EFSRPC coercion, NETLOGON, SAMR / LSARPC) | `note` | info |
 
 Active scanning (`--scope`, opt-in) adds `host` / `service` findings from TCP
-connect host discovery, port enumeration and banner grabbing.
+connect host discovery, port enumeration and banner grabbing. Web diagnostics
+(`--web <URL>`, opt-in, non-destructive) add `web` findings:
+
+| Check | What it flags | severity |
+|---|---|---|
+| Transport | plaintext HTTP (no TLS) | medium |
+| HSTS | missing Strict-Transport-Security on https | medium |
+| Security headers | missing CSP / X-Content-Type-Options / X-Frame-Options / Referrer-Policy | low / info |
+| Cookie flags | Set-Cookie without Secure / HttpOnly / SameSite | medium / low |
+| Disclosure | `Server` version, `X-Powered-By` | low |
 
 ## Install
 
@@ -119,7 +137,9 @@ cargo build --release
 # binary at target/release/sanctum
 ```
 
-Zero third-party dependencies — a std-only Rust build, so it builds offline.
+Tiers T0 / T1 are std-only. The T2 web tier (ADR 0001) adds a small, pinned
+dependency set — `ureq` over `rustls` (no OpenSSL, no async runtime) — so the
+build fetches those crates; everything else stays dependency-free.
 
 ## Usage
 
@@ -147,6 +167,9 @@ sanctum --scope 192.0.2.0/28 --ports 22,80,443 --json out.json --i-am-authorized
 
 # Offline analysis of a local file (no network, no authorization needed):
 sanctum --file ./suspect.bin --json out.json
+
+# Non-destructive web diagnostics of one authorized URL:
+sanctum --web https://app.example.com/ --json out.json --i-am-authorized
 ```
 
 In Zume, configure a second analyzer for files (its `{target}` is a path):

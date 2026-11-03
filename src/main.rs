@@ -31,6 +31,7 @@ mod t0;
 mod timefmt;
 mod tls;
 mod util;
+mod web;
 
 use std::fs::File;
 use std::io::Read;
@@ -49,6 +50,7 @@ const PCAP_MAX_ROWS: usize = 50; // cap host / service findings
 struct Args {
     scope: Option<String>,
     file: Option<String>,
+    web: Option<String>,
     json_out: Option<String>,
     ports: Option<String>,
     authorized: bool,
@@ -65,6 +67,7 @@ impl Default for Args {
         Args {
             scope: None,
             file: None,
+            web: None,
             json_out: None,
             ports: None,
             authorized: false,
@@ -96,13 +99,20 @@ fn run() -> i32 {
         print_usage();
         return 0;
     }
-    if args.scope.is_some() && args.file.is_some() {
-        eprintln!("sanctum: use --scope (network recon) or --file (offline analysis), not both");
+    let modes = args.scope.is_some() as u8 + args.file.is_some() as u8 + args.web.is_some() as u8;
+    if modes > 1 {
+        eprintln!(
+            "sanctum: choose one of --scope (recon), --file (offline) or --web (web), not several"
+        );
         return 2;
     }
     // Tier T0: offline analysis of a local file (no network, no authorization gate).
     if let Some(file) = args.file.clone() {
         return run_file_analysis(&args, &file);
+    }
+    // Tier T2: active but non-destructive web diagnostics (ADR 0001).
+    if let Some(url) = args.web.clone() {
+        return run_web(&args, &url);
     }
     let scope_str = match &args.scope {
         Some(s) => s.clone(),
@@ -449,6 +459,89 @@ fn target_label(ip: &IpAddr, port: u16) -> String {
     }
 }
 
+/// Tier T2 (ADR 0001): active but non-destructive web diagnostics against one
+/// authorized URL. Gated by --i-am-authorized, like network recon; it makes one
+/// GET and audits the response (headers, cookies, transport). No exploitation.
+fn run_web(args: &Args, url: &str) -> i32 {
+    let started = timefmt::iso8601_now();
+    let mut report = Report::new(url.to_string(), started.clone());
+    let audit = audit::audit_path(args.audit.as_deref());
+
+    let scheme = web::scheme_of(url);
+    if scheme != "http" && scheme != "https" {
+        report.warnings.push(format!(
+            "web: unsupported URL scheme (need http/https): {url}"
+        ));
+        report.finished = timefmt::iso8601_now();
+        write_result(&report, args);
+        eprintln!("sanctum: --web needs an http:// or https:// URL");
+        return 2;
+    }
+
+    if !args.authorized {
+        let w = format!(
+            "refused: web diagnostics are active requests. Re-run with --i-am-authorized to \
+             confirm you are authorized to test {}. Authorized testing only.",
+            web::host_of(url)
+        );
+        report.warnings.push(w);
+        report.finished = timefmt::iso8601_now();
+        audit::log(
+            &audit,
+            &format!("{started} refused_unauthorized web={}", result::jstr(url)),
+        );
+        write_result(&report, args);
+        eprintln!(
+            "sanctum: refused - pass --i-am-authorized to run web diagnostics against {}. \
+             You must be authorized to test this target.",
+            web::host_of(url)
+        );
+        return 3;
+    }
+
+    audit::log(
+        &audit,
+        &format!("{started} web_run url={}", result::jstr(url)),
+    );
+    // Web responses need more headroom than a TCP connect; honor an explicit
+    // --timeout-ms but floor it so a default 800 ms does not spuriously fail.
+    let timeout = Duration::from_millis(args.timeout_ms.max(5000));
+    match web::fetch(url, timeout) {
+        Ok(resp) => {
+            for f in web::audit_response(url, resp.status, &resp.headers) {
+                report.findings.push(f);
+            }
+        }
+        Err(e) => {
+            report.warnings.push(format!("web: request failed: {e}"));
+            audit::log(
+                &audit,
+                &format!(
+                    "{started} web_error url={} err={}",
+                    result::jstr(url),
+                    result::jstr(&e)
+                ),
+            );
+        }
+    }
+    report.finished = timefmt::iso8601_now();
+    audit::log(
+        &audit,
+        &format!(
+            "{started} web_done url={} findings={}",
+            result::jstr(url),
+            report.findings.len()
+        ),
+    );
+    write_result(&report, args);
+    eprintln!(
+        "sanctum: web diagnostics of {} - {} finding(s)",
+        web::host_of(url),
+        report.findings.len()
+    );
+    0
+}
+
 /// Write the result JSON to --json (the editor's {out}), else to stdout.
 fn write_result(report: &Report, args: &Args) {
     let json = report.to_json();
@@ -471,6 +564,7 @@ fn parse_args() -> Result<Args, String> {
             "--i-am-authorized" => args.authorized = true,
             "--scope" => args.scope = Some(need_value(&mut it, "--scope")?),
             "--file" => args.file = Some(need_value(&mut it, "--file")?),
+            "--web" => args.web = Some(need_value(&mut it, "--web")?),
             "--json" => args.json_out = Some(need_value(&mut it, "--json")?),
             "--ports" => args.ports = Some(need_value(&mut it, "--ports")?),
             "--audit" => args.audit = Some(need_value(&mut it, "--audit")?),
@@ -518,15 +612,21 @@ USAGE:
               [--max-ports <N>]
     Offline file analysis (tier T0, no network):
       sanctum --file <PATH> [--json <PATH>] [--audit <PATH>]
+    Web diagnostics (tier T2, non-destructive):
+      sanctum --web <URL> --i-am-authorized [--json <PATH>] [--audit <PATH>]
+              [--timeout-ms <N>]
 
-AUTHORIZED USE ONLY. Active probing (--scope) is refused without
+AUTHORIZED USE ONLY. Active work (--scope, --web) is refused without
 --i-am-authorized. Only run it against systems you own or are explicitly
 permitted to test. --file is passive: it reads a local file and sends nothing.
+--web is non-destructive: it never exploits, extracts data or bypasses anything.
 
 OPTIONS:
     --scope <SCOPE>      An IP, an IPv4 CIDR (a.b.c.d/bits), a hostname, or a URL.
     --file <PATH>        Analyze a local file offline: type, hashes (CRC32 / MD5 /
                          SHA-1 / SHA-256), entropy and printable strings.
+    --web <URL>          Audit one http(s) URL non-destructively: security headers,
+                         cookie flags, software disclosure and transport posture.
     --i-am-authorized    Confirm you are authorized to test the scope (required).
     --json <PATH>        Write the result JSON here (Zume passes {out}); else stdout.
     --ports <SPEC>       Ports: \"22,80,443,8000-8010\" (default: a common set).

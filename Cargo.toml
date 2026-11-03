@@ -1,6 +1,6 @@
 [package]
 name = "sanctum"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 rust-version = "1.70"
 license = "Apache-2.0"
@@ -10,9 +10,11 @@ readme = "README.md"
 keywords = ["security", "pentest", "recon", "authorized", "zume"]
 categories = ["command-line-utilities"]
 
-# Zero third-party dependencies on purpose: the std library is enough, the build
-# is offline, and the attack surface stays minimal.
+# Tiers T0 / T1 are std-only. The T2 web-diagnostic tier (ADR 0001) needs a
+# correct HTTPS client, so it uses ureq (synchronous) over rustls - no OpenSSL,
+# no async runtime. The dependency set is kept small and pinned in Cargo.lock.
 [dependencies]
+ureq = "2"
 
 [[bin]]
 name = "sanctum"
