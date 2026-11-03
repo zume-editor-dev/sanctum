@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.10)
+## What it does (v0.11)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -54,13 +54,18 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   handshakes — **NTLMSSP** challenge/authenticate (domain \\ user, workstation,
   server challenge, NetNTLMv1/v2 presence; raw or base64 in HTTP) and
   **Kerberos** AS-REQ / AS-REP / TGS messages (principal and realm) — as
-  high-severity findings.
+  high-severity findings. For Kerberos it also reports the **encryption type** of
+  any EncryptedData and flags a weak one (RC4-HMAC / DES) as a **Kerberoast /
+  AS-REP-roast** candidate (v0.11).
 - **Tier T0 — SMB2 / LDAP** (v0.10): reads the **LDAP** BindRequest — a *simple*
   bind's DN and **cleartext password** (a high-severity credential), a SASL
-  bind's mechanism — and summarizes **SMB1/SMB2** session context: SMB1 (legacy,
-  insecure) in use, the negotiated SMB2 dialect, that a SESSION_SETUP (where NTLM
-  / Kerberos authentication happens — the token is recovered above) was seen, and
-  the **TREE_CONNECT** share paths (`\\server\share`) accessed.
+  bind's mechanism, a **StartTLS** request, and a **SearchRequest**'s base DN,
+  rendered filter (e.g. `(servicePrincipalName=*)`) and requested attributes
+  (v0.11) — and summarizes **SMB1/SMB2** session context: SMB1 (legacy, insecure)
+  in use, the negotiated SMB2 dialect, the server's **signing** policy (required
+  / enabled / off, v0.11), that a SESSION_SETUP (where NTLM / Kerberos
+  authentication happens — the token is recovered above) was seen, and the
+  **TREE_CONNECT** share paths and **CREATE** file paths (v0.11) accessed.
 - Emits **result format v1** JSON that the editor lists and can act on.
 
 Heavier network capability (authenticated checks, templated probes) is out of

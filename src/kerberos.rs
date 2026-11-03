@@ -68,6 +68,43 @@ fn collect(b: &[u8], start: usize, end: usize, depth: u32, out: &mut Vec<String>
     }
 }
 
+fn etype_name(v: u8) -> Option<(&'static str, bool)> {
+    // (name, weak) for the common Kerberos encryption types.
+    Some(match v {
+        1 => ("des-cbc-crc", true),
+        3 => ("des-cbc-md5", true),
+        17 => ("aes128-cts-hmac-sha1", false),
+        18 => ("aes256-cts-hmac-sha1", false),
+        23 => ("rc4-hmac", true),
+        24 => ("rc4-hmac-exp", true),
+        _ => return None,
+    })
+}
+
+/// Report the encryption types of any EncryptedData in the message. An
+/// EncryptedData begins `A0 03 02 01 <etype>` (etype [0] INTEGER, one byte);
+/// a weak etype (RC4 / DES) on a ticket or reply is a Kerberoast / AS-REP-roast
+/// candidate. The known-etype filter avoids matching version numbers.
+fn scan_etypes(msg: &[u8], out: &mut Vec<String>) {
+    let mut i = 0usize;
+    while i + 5 <= msg.len() {
+        if msg[i] == 0xA0 && msg[i + 1] == 0x03 && msg[i + 2] == 0x02 && msg[i + 3] == 0x01 {
+            if let Some((name, weak)) = etype_name(msg[i + 4]) {
+                let v = msg[i + 4];
+                let note = if weak {
+                    format!(
+                        "Kerberos etype {name} ({v}) - weak, crackable (Kerberoast / AS-REP roast candidate)"
+                    )
+                } else {
+                    format!("Kerberos etype {name} ({v})")
+                };
+                push_uniq(out, note, CAP);
+            }
+        }
+        i += 1;
+    }
+}
+
 /// Scan a payload for a Kerberos message and report its type and principals.
 pub fn scan(payload: &[u8], out: &mut Vec<String>) {
     // Raw (UDP/88), or behind a 4-byte TCP length prefix.
@@ -93,6 +130,7 @@ pub fn scan(payload: &[u8], out: &mut Vec<String>) {
         format!("Kerberos {name}: {}", strings.join(", "))
     };
     push_uniq(out, detail, CAP);
+    scan_etypes(msg, out);
 }
 
 #[cfg(test)]
@@ -132,6 +170,32 @@ mod tests {
         let mut out = Vec::new();
         scan(&framed, &mut out);
         assert!(out.iter().any(|s| s.starts_with("Kerberos AS-REQ:")));
+    }
+
+    #[test]
+    fn flags_weak_etype() {
+        // An AS-REP (0x6b) whose enc-part EncryptedData uses RC4-HMAC (etype 23).
+        let mut body = gstr("bob");
+        body.extend_from_slice(&[0xA0, 0x03, 0x02, 0x01, 23]); // etype [0] = 23
+        let mut app = vec![0x6b, body.len() as u8];
+        app.extend_from_slice(&body);
+        let mut out = Vec::new();
+        scan(&app, &mut out);
+        assert!(out
+            .iter()
+            .any(|s| s.contains("rc4-hmac (23)") && s.contains("Kerberoast")));
+    }
+
+    #[test]
+    fn reports_strong_etype_without_warning() {
+        let mut body = gstr("svc");
+        body.extend_from_slice(&[0xA0, 0x03, 0x02, 0x01, 18]); // aes256
+        let mut app = vec![0x6d, body.len() as u8];
+        app.extend_from_slice(&body);
+        let mut out = Vec::new();
+        scan(&app, &mut out);
+        assert!(out.iter().any(|s| s.contains("aes256-cts-hmac-sha1 (18)")));
+        assert!(!out.iter().any(|s| s.contains("crackable")));
     }
 
     #[test]

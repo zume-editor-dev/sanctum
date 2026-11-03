@@ -14,6 +14,20 @@ fn le16(b: &[u8], o: usize) -> Option<u16> {
     Some(u16::from_le_bytes([*b.get(o)?, *b.get(o + 1)?]))
 }
 
+/// A UTF-16LE string at `off` (from the SMB2 header start) of `len` bytes.
+fn utf16_at(hdr: &[u8], off: Option<u16>, len: Option<u16>) -> Option<String> {
+    let (off, len) = (off? as usize, len? as usize);
+    if !(2..=1024).contains(&len) {
+        return None;
+    }
+    let raw = hdr.get(off..off + len)?;
+    let units: Vec<u16> = raw
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
 fn dialect_name(d: u16) -> Option<&'static str> {
     Some(match d {
         0x0202 => "2.0.2",
@@ -60,6 +74,16 @@ pub fn scan(payload: &[u8], notes: &mut Vec<String>) {
                 if let Some(name) = le16(body, 4).and_then(dialect_name) {
                     push_uniq(notes, format!("SMB2 negotiate: dialect {name}"), CAP);
                 }
+                if let Some(mode) = le16(body, 2) {
+                    let signing = if mode & 0x0002 != 0 {
+                        "required"
+                    } else if mode & 0x0001 != 0 {
+                        "enabled (not required)"
+                    } else {
+                        "not offered"
+                    };
+                    push_uniq(notes, format!("SMB2 signing: {signing}"), CAP);
+                }
             }
             0x0001 => {
                 push_uniq(
@@ -71,18 +95,15 @@ pub fn scan(payload: &[u8], notes: &mut Vec<String>) {
             0x0003 if !is_response => {
                 // TREE_CONNECT request: StructureSize(2), Flags(2), PathOffset(2),
                 // PathLength(2); PathOffset is from the SMB2 header start.
-                if let (Some(poff), Some(plen)) = (le16(body, 4), le16(body, 6)) {
-                    let (poff, plen) = (poff as usize, plen as usize);
-                    if (2..=1024).contains(&plen) {
-                        if let Some(raw) = hdr.get(poff..poff + plen) {
-                            let units: Vec<u16> = raw
-                                .chunks_exact(2)
-                                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                                .collect();
-                            let path = String::from_utf16_lossy(&units);
-                            push_uniq(notes, format!("SMB2 tree connect: {path}"), CAP);
-                        }
-                    }
+                if let Some(path) = utf16_at(hdr, le16(body, 4), le16(body, 6)) {
+                    push_uniq(notes, format!("SMB2 tree connect: {path}"), CAP);
+                }
+            }
+            0x0005 if !is_response => {
+                // CREATE request: the file name is at NameOffset (from the header
+                // start) / NameLength, both in the fixed part at body offsets 44 / 46.
+                if let Some(path) = utf16_at(hdr, le16(body, 44), le16(body, 46)) {
+                    push_uniq(notes, format!("SMB2 create: {path}"), CAP);
                 }
             }
             _ => {}
@@ -147,6 +168,34 @@ mod tests {
         assert!(notes
             .iter()
             .any(|n| *n == format!("SMB2 tree connect: {unc}")));
+    }
+
+    #[test]
+    fn reports_signing_required() {
+        let mut body = vec![65u8, 0];
+        body.extend_from_slice(&0x0002u16.to_le_bytes()); // SecurityMode: signing required
+        body.extend_from_slice(&0x0311u16.to_le_bytes()); // dialect
+        body.extend_from_slice(&[0u8; 10]);
+        let pkt = smb2(0x0000, true, 0, &body);
+        let mut notes = Vec::new();
+        scan(&pkt, &mut notes);
+        assert!(notes.iter().any(|n| n == "SMB2 signing: required"));
+    }
+
+    #[test]
+    fn extracts_create_path() {
+        let name = "Users\\secret.docx";
+        let utf16: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let name_off = 64 + 48; // header + a 48-byte fixed body
+        let mut body = vec![0u8; 48];
+        body[0] = 57; // StructureSize
+        body[44..46].copy_from_slice(&(name_off as u16).to_le_bytes());
+        body[46..48].copy_from_slice(&(utf16.len() as u16).to_le_bytes());
+        body.extend_from_slice(&utf16);
+        let pkt = smb2(0x0005, false, 0, &body);
+        let mut notes = Vec::new();
+        scan(&pkt, &mut notes);
+        assert!(notes.iter().any(|n| *n == format!("SMB2 create: {name}")));
     }
 
     #[test]
