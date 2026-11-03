@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.12)
+## What it does (v0.13)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -71,6 +71,11 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   matter for lateral movement: **DRSUAPI** (DCSync), **SVCCTL** / task scheduler
   (remote exec), **SPOOLSS** / **EFSRPC** (coercion), **NETLOGON**, **SAMR** /
   **LSARPC** (enumeration).
+- **Tier T0 — SNMP / RADIUS** (v0.13): recovers an **SNMP** v1 / v2c **community
+  string** (the device password, in the clear) as a high-severity credential,
+  and reads a **RADIUS** packet — the cleartext **User-Name** and calling
+  station, whether a secret-encrypted User-Password is present, and a Microsoft
+  **MS-CHAP** VSA (crackable offline) — as session context and auth material.
 - Emits **result format v1** JSON that the editor lists and can act on.
 
 Heavier network capability (authenticated checks, templated probes) is out of
