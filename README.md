@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.16)
+## What it does (v0.17)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -87,8 +87,13 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   site-wide findings collapsed. With **`--active`** (v0.16) it probes query
   parameters for **reflected XSS**: it sends a benign unique marker (no script
   executes) and reports a parameter whose injected `<` comes back **unencoded**
-  as a high-severity candidate, or an encoded reflection as info. Later
-  increments add non-destructive SQL-injection / open-redirect **detection**.
+  as a high-severity candidate, or an encoded reflection as info. It also probes
+  for **SQL injection** (v0.17) — **error-based** (a single quote surfaces a DB
+  error a clean response lacked) and **time-based** (a bounded `SLEEP`/`pg_sleep`/
+  `WAITFOR` payload delays the response, confirmed with a second probe to shed
+  jitter) — reporting the parameter as a high-severity candidate. **Existence
+  only: no data is ever read.** Later increments add open-redirect / directory
+  detection.
 - Emits **result format v1** JSON that the editor lists and can act on.
 
 Exploitation, payload / shellcode generation, C2, data extraction (e.g. sqlmap
@@ -136,6 +141,8 @@ connect host discovery, port enumeration and banner grabbing. Web diagnostics
 | Disclosure | `Server` version, `X-Powered-By` | low |
 | Reflected XSS (`--active`) | a query parameter reflected unencoded (injected `<` survives) | high |
 | Reflected input (`--active`) | a query parameter reflected but HTML-encoded | info |
+| SQLi error-based (`--active`) | a single quote surfaces a DB error (MySQL / MSSQL / PostgreSQL / Oracle / SQLite) | high |
+| SQLi time-based (`--active`) | a bounded sleep payload delays the response (confirmed twice) | high |
 
 ## Install
 

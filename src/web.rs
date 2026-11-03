@@ -8,7 +8,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::result::Finding;
 
@@ -517,6 +517,188 @@ pub fn reflected_xss_scan(
     out
 }
 
+// ---- SQL-injection detection (ADR 0001, non-destructive, existence only) ----
+//
+// Error-based: a single quote should break a query and surface a DB error that
+// a clean response did not have. Time-based: a bounded sleep payload should
+// delay the response only if it is injected into a query; a delay is confirmed
+// with a second probe to shed network jitter. Nothing is extracted - this only
+// establishes that a parameter reaches a SQL interpreter. GET only, capped,
+// rate-limited.
+
+const SQL_SLEEP_SECONDS: u64 = 3;
+const SQL_TIME_THRESHOLD_MS: u128 = 2500; // a convincing delay for a 3 s sleep
+const SQL_BASE_MAX_MS: u128 = 1200; // only trust timing when the baseline is fast
+
+/// A known database error signature in `body` -> the database name.
+pub fn sql_error_signature(body: &str) -> Option<&'static str> {
+    let low = body.to_ascii_lowercase();
+    const SIGS: &[(&str, &str)] = &[
+        ("you have an error in your sql syntax", "MySQL"),
+        ("warning: mysqli", "MySQL"),
+        ("warning: mysql_", "MySQL"),
+        ("mysql_fetch", "MySQL"),
+        ("check the manual that corresponds to your", "MySQL"),
+        (
+            "unclosed quotation mark after the character string",
+            "MSSQL",
+        ),
+        ("microsoft odbc", "MSSQL"),
+        ("microsoft ole db provider for sql server", "MSSQL"),
+        ("odbc sql server driver", "MSSQL"),
+        ("unterminated quoted string at or near", "PostgreSQL"),
+        ("syntax error at or near", "PostgreSQL"),
+        ("pg_query(", "PostgreSQL"),
+        ("ora-00933", "Oracle"),
+        ("ora-01756", "Oracle"),
+        ("quoted string not properly terminated", "Oracle"),
+        ("sqlite3::", "SQLite"),
+        ("sqlite error", "SQLite"),
+        ("sqlite_error", "SQLite"),
+    ];
+    SIGS.iter()
+        .find(|(n, _)| low.contains(n))
+        .map(|(_, db)| *db)
+}
+
+/// Percent-decode a query value ('%XX' and '+').
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(v);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A delay is a time-based SQLi signal when the baseline was fast and both the
+/// probe and its confirmation crossed the threshold.
+pub fn timing_verdict(base_ms: u128, probe_ms: u128, confirm_ms: u128, threshold: u128) -> bool {
+    base_ms < threshold && probe_ms >= threshold && confirm_ms >= threshold
+}
+
+/// Probe query parameters for SQL injection (error-based, then bounded
+/// time-based). Non-destructive: no data is read; it only establishes that a
+/// parameter reaches a SQL interpreter. Deduped by path+name, capped, rate-limited.
+pub fn sql_injection_scan(
+    urls: &[String],
+    timeout: Duration,
+    delay: Duration,
+    max_probes: usize,
+) -> Vec<Finding> {
+    let time_payloads = [
+        format!("' AND SLEEP({SQL_SLEEP_SECONDS})-- -"),
+        format!("';SELECT pg_sleep({SQL_SLEEP_SECONDS})-- -"),
+        format!("';WAITFOR DELAY '0:0:{SQL_SLEEP_SECONDS}'-- -"),
+        format!(" AND SLEEP({SQL_SLEEP_SECONDS})"),
+    ];
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut probes = 0usize;
+    for url in urls {
+        let params = query_params(url);
+        if params.is_empty() {
+            continue;
+        }
+        let t0 = Instant::now();
+        let baseline = fetch(url, timeout).ok();
+        let base_ms = t0.elapsed().as_millis();
+        let base_has_err = baseline
+            .as_ref()
+            .map(|r| sql_error_signature(&r.body).is_some())
+            .unwrap_or(false);
+        for (i, (name, value)) in params.iter().enumerate() {
+            if probes >= max_probes {
+                return out;
+            }
+            let path = url.split('?').next().unwrap_or(url);
+            if !seen.insert(format!("{path}\u{1}{name}\u{1}sql")) {
+                continue;
+            }
+            let decoded = pct_decode(value);
+            // Error-based: a single quote.
+            if probes > 0 {
+                std::thread::sleep(delay);
+            }
+            probes += 1;
+            let mut flagged = false;
+            let err_url = set_param(url, i, &format!("{decoded}'"));
+            if let Ok(r) = fetch(&err_url, timeout) {
+                if !base_has_err {
+                    if let Some(db) = sql_error_signature(&r.body) {
+                        out.push(
+                            Finding::new(
+                                "web",
+                                "high",
+                                url.clone(),
+                                "SQL injection (error-based) candidate",
+                            )
+                            .detail(format!(
+                                "parameter `{name}` triggers a {db} error on a single quote"
+                            )),
+                        );
+                        flagged = true;
+                    }
+                }
+            }
+            if flagged || base_ms >= SQL_BASE_MAX_MS {
+                continue; // already found, or baseline too slow to trust timing
+            }
+            // Time-based: a bounded sleep payload, confirmed once.
+            for payload in &time_payloads {
+                if probes >= max_probes {
+                    return out;
+                }
+                std::thread::sleep(delay);
+                probes += 1;
+                let u = set_param(url, i, &format!("{decoded}{payload}"));
+                let t = Instant::now();
+                let ok1 = fetch(&u, timeout).is_ok();
+                let ms1 = t.elapsed().as_millis();
+                if !ok1 || ms1 < SQL_TIME_THRESHOLD_MS {
+                    continue;
+                }
+                if probes >= max_probes {
+                    return out;
+                }
+                probes += 1;
+                let t2 = Instant::now();
+                let ok2 = fetch(&u, timeout).is_ok();
+                let ms2 = t2.elapsed().as_millis();
+                if ok2 && timing_verdict(base_ms, ms1, ms2, SQL_TIME_THRESHOLD_MS) {
+                    out.push(
+                        Finding::new("web", "high", url.clone(), "SQL injection (time-based) candidate")
+                            .detail(format!(
+                                "parameter `{name}` delayed ~{SQL_SLEEP_SECONDS}s on a time-based payload"
+                            )),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,6 +853,44 @@ mod tests {
             "info"
         );
         assert!(xss_finding("https://ex.com/?q=1", "q", Reflection::None).is_none());
+    }
+
+    #[test]
+    fn recognizes_sql_error_signatures() {
+        assert_eq!(
+            sql_error_signature("You have an error in your SQL syntax; check..."),
+            Some("MySQL")
+        );
+        assert_eq!(
+            sql_error_signature("Unclosed quotation mark after the character string ''."),
+            Some("MSSQL")
+        );
+        assert_eq!(
+            sql_error_signature("ERROR: unterminated quoted string at or near \"'\""),
+            Some("PostgreSQL")
+        );
+        assert_eq!(
+            sql_error_signature("ORA-00933: SQL command not properly ended"),
+            Some("Oracle")
+        );
+        assert_eq!(sql_error_signature("a perfectly normal page"), None);
+    }
+
+    #[test]
+    fn pct_decode_roundish() {
+        assert_eq!(pct_decode("a%3Cb%3E"), "a<b>");
+        assert_eq!(pct_decode("x+y"), "x y");
+        assert_eq!(pct_decode("plain"), "plain");
+        assert_eq!(pct_decode("bad%zz"), "bad%zz");
+    }
+
+    #[test]
+    fn timing_verdict_needs_fast_baseline_and_two_slow_probes() {
+        let t = 2500;
+        assert!(timing_verdict(200, 3000, 3100, t)); // fast base, both slow
+        assert!(!timing_verdict(200, 3000, 500, t)); // confirmation fast -> jitter
+        assert!(!timing_verdict(3000, 3000, 3000, t)); // slow baseline -> untrusted
+        assert!(!timing_verdict(200, 1000, 1000, t)); // no delay
     }
 
     #[test]

@@ -578,13 +578,11 @@ fn run_web(args: &Args, url: &str) -> i32 {
             &audit,
             &format!("{started} web_active url={}", result::jstr(url)),
         );
-        let xss = web::reflected_xss_scan(
-            &candidates,
-            timeout,
-            Duration::from_millis(WEB_CRAWL_DELAY_MS),
-            WEB_MAX_PROBES,
-        );
-        for f in xss {
+        let delay = Duration::from_millis(WEB_CRAWL_DELAY_MS);
+        for f in web::reflected_xss_scan(&candidates, timeout, delay, WEB_MAX_PROBES) {
+            report.findings.push(f);
+        }
+        for f in web::sql_injection_scan(&candidates, timeout, delay, WEB_MAX_PROBES) {
             report.findings.push(f);
         }
     }
@@ -701,8 +699,9 @@ OPTIONS:
     --crawl              With --web: follow same-origin links and audit each page
                          (bounded, rate-limited; non-destructive).
     --active             With --web: non-destructive active detection - probe
-                         query parameters for reflected XSS (benign marker, no
-                         payload executes). Rate-limited and capped.
+                         query parameters for reflected XSS (benign marker) and
+                         SQL injection (error- and bounded time-based; existence
+                         only, no data read). Rate-limited and capped.
     --max-pages <N>      Crawl page cap (default 20).
     --i-am-authorized    Confirm you are authorized to test the scope (required).
     --json <PATH>        Write the result JSON here (Zume passes {out}); else stdout.
