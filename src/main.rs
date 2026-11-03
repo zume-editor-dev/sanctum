@@ -43,6 +43,9 @@ use result::{Finding, Report};
 const DEFAULT_TIMEOUT_MS: u64 = 800;
 const DEFAULT_MAX_HOSTS: usize = 1024;
 const DEFAULT_MAX_PORTS: usize = 1024;
+const DEFAULT_MAX_PAGES: usize = 20; // T2 crawl page cap
+const WEB_CRAWL_DEPTH: u32 = 2;
+const WEB_CRAWL_DELAY_MS: u64 = 300; // rate limit between crawl requests
 const PCAP_READ_CAP: u64 = 64 * 1024 * 1024; // bytes of a pcap read for summary
 const PCAP_MAX_PACKETS: u64 = 200_000;
 const PCAP_MAX_ROWS: usize = 50; // cap host / service findings
@@ -59,6 +62,8 @@ struct Args {
     max_hosts: usize,
     max_ports: usize,
     banner: bool,
+    crawl: bool,
+    max_pages: usize,
     help: bool,
 }
 
@@ -76,6 +81,8 @@ impl Default for Args {
             max_hosts: DEFAULT_MAX_HOSTS,
             max_ports: DEFAULT_MAX_PORTS,
             banner: true,
+            crawl: false,
+            max_pages: DEFAULT_MAX_PAGES,
             help: false,
         }
     }
@@ -501,27 +508,59 @@ fn run_web(args: &Args, url: &str) -> i32 {
 
     audit::log(
         &audit,
-        &format!("{started} web_run url={}", result::jstr(url)),
+        &format!(
+            "{started} web_run url={} crawl={}",
+            result::jstr(url),
+            args.crawl
+        ),
     );
     // Web responses need more headroom than a TCP connect; honor an explicit
     // --timeout-ms but floor it so a default 800 ms does not spuriously fail.
     let timeout = Duration::from_millis(args.timeout_ms.max(5000));
-    match web::fetch(url, timeout) {
-        Ok(resp) => {
-            for f in web::audit_response(url, resp.status, &resp.headers) {
-                report.findings.push(f);
-            }
-        }
-        Err(e) => {
-            report.warnings.push(format!("web: request failed: {e}"));
-            audit::log(
-                &audit,
-                &format!(
-                    "{started} web_error url={} err={}",
-                    result::jstr(url),
-                    result::jstr(&e)
-                ),
+    if args.crawl {
+        // Bounded, same-origin, rate-limited crawl, auditing every page.
+        let res = web::crawl(
+            url,
+            timeout,
+            args.max_pages,
+            WEB_CRAWL_DEPTH,
+            Duration::from_millis(WEB_CRAWL_DELAY_MS),
+        );
+        report.findings.push(
+            Finding::new("web", "info", url.to_string(), "Crawl summary").detail(format!(
+                "{} same-origin page(s) fetched (depth <= {}, cap {})",
+                res.pages.len(),
+                WEB_CRAWL_DEPTH,
+                args.max_pages
+            )),
+        );
+        for (page, status) in res.pages.iter().take(PCAP_MAX_ROWS) {
+            report.findings.push(
+                Finding::new("web", "info", page.clone(), "Page")
+                    .detail(format!("status {status}")),
             );
+        }
+        for f in res.findings {
+            report.findings.push(f);
+        }
+    } else {
+        match web::fetch(url, timeout) {
+            Ok(resp) => {
+                for f in web::audit_response(url, resp.status, &resp.headers) {
+                    report.findings.push(f);
+                }
+            }
+            Err(e) => {
+                report.warnings.push(format!("web: request failed: {e}"));
+                audit::log(
+                    &audit,
+                    &format!(
+                        "{started} web_error url={} err={}",
+                        result::jstr(url),
+                        result::jstr(&e)
+                    ),
+                );
+            }
         }
     }
     report.finished = timefmt::iso8601_now();
@@ -584,6 +623,12 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| "invalid --max-ports".to_string())?;
             }
             "--no-banner" => args.banner = false,
+            "--crawl" => args.crawl = true,
+            "--max-pages" => {
+                args.max_pages = need_value(&mut it, "--max-pages")?
+                    .parse()
+                    .map_err(|_| "invalid --max-pages".to_string())?;
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -613,8 +658,8 @@ USAGE:
     Offline file analysis (tier T0, no network):
       sanctum --file <PATH> [--json <PATH>] [--audit <PATH>]
     Web diagnostics (tier T2, non-destructive):
-      sanctum --web <URL> --i-am-authorized [--json <PATH>] [--audit <PATH>]
-              [--timeout-ms <N>]
+      sanctum --web <URL> --i-am-authorized [--crawl] [--max-pages <N>]
+              [--json <PATH>] [--audit <PATH>] [--timeout-ms <N>]
 
 AUTHORIZED USE ONLY. Active work (--scope, --web) is refused without
 --i-am-authorized. Only run it against systems you own or are explicitly
@@ -627,6 +672,9 @@ OPTIONS:
                          SHA-1 / SHA-256), entropy and printable strings.
     --web <URL>          Audit one http(s) URL non-destructively: security headers,
                          cookie flags, software disclosure and transport posture.
+    --crawl              With --web: follow same-origin links and audit each page
+                         (bounded, rate-limited; non-destructive).
+    --max-pages <N>      Crawl page cap (default 20).
     --i-am-authorized    Confirm you are authorized to test the scope (required).
     --json <PATH>        Write the result JSON here (Zume passes {out}); else stdout.
     --ports <SPEC>       Ports: \"22,80,443,8000-8010\" (default: a common set).

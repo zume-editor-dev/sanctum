@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.14)
+## What it does (v0.15)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -81,9 +81,11 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   the response — missing / weak **security headers** (HSTS, CSP,
   X-Content-Type-Options, X-Frame-Options, Referrer-Policy), **cookie flags**
   (Secure / HttpOnly / SameSite), **software / version disclosure** (`Server`,
-  `X-Powered-By`) and the **transport posture** (plaintext HTTP). Detection
-  only; later increments add a bounded crawl and non-destructive reflected-XSS /
-  SQL-injection / open-redirect **detection**.
+  `X-Powered-By`) and the **transport posture** (plaintext HTTP). With
+  **`--crawl`** (v0.15) it follows **same-origin** links (bounded by
+  `--max-pages`, depth-limited and rate-limited) and audits every page, with the
+  site-wide findings collapsed. Detection only; later increments add
+  non-destructive reflected-XSS / SQL-injection / open-redirect **detection**.
 - Emits **result format v1** JSON that the editor lists and can act on.
 
 Exploitation, payload / shellcode generation, C2, data extraction (e.g. sqlmap

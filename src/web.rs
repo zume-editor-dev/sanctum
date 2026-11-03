@@ -6,9 +6,13 @@
 //! exploits, extracts data, or bypasses anything - it reports what a single,
 //! ordinary response reveals.
 
+use std::collections::{HashSet, VecDeque};
+use std::io::Read;
 use std::time::Duration;
 
 use crate::result::Finding;
+
+const BODY_CAP: u64 = 512 * 1024; // bytes of a page body read for link extraction
 
 /// The scheme of a URL ("http" / "https"), lowercased; empty if none.
 pub fn scheme_of(url: &str) -> String {
@@ -34,6 +38,7 @@ pub fn host_of(url: &str) -> String {
 pub struct Fetched {
     pub status: u16,
     pub headers: Vec<(String, String)>, // (lowercased name, value)
+    pub body: String,                   // bounded, UTF-8 lossy (for link extraction)
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -156,7 +161,204 @@ pub fn fetch(url: &str, timeout: Duration) -> Result<Fetched, String> {
             headers.push((name.to_ascii_lowercase(), value.to_string()));
         }
     }
-    Ok(Fetched { status, headers })
+    // A bounded body read, only for link extraction during a crawl.
+    let mut buf = Vec::new();
+    resp.into_reader().take(BODY_CAP).read_to_end(&mut buf).ok();
+    let body = String::from_utf8_lossy(&buf).into_owned();
+    Ok(Fetched {
+        status,
+        headers,
+        body,
+    })
+}
+
+// ---- bounded same-origin crawl (ADR 0001, non-destructive) -----------------
+
+/// Two URLs share an origin when their scheme and host[:port] match.
+pub fn same_origin(a: &str, b: &str) -> bool {
+    scheme_of(a) == scheme_of(b) && host_of(a) == host_of(b)
+}
+
+fn strip_fragment(url: &str) -> String {
+    url.split('#').next().unwrap_or("").to_string()
+}
+
+/// The directory portion of a URL ("https://h/a/b" -> "https://h/a/").
+fn base_dir(base: &str) -> String {
+    let prefix = format!("{}://{}", scheme_of(base), host_of(base));
+    let rest = base.get(prefix.len()..).unwrap_or("");
+    let path = rest.split(['?', '#']).next().unwrap_or("");
+    match path.rfind('/') {
+        Some(i) => format!("{prefix}{}", &path[..=i]),
+        None => format!("{prefix}/"),
+    }
+}
+
+/// Resolve a link (absolute, scheme-relative, root-relative or relative)
+/// against `base` into an absolute http(s) URL; non-navigable schemes and pure
+/// fragments yield None.
+pub fn resolve_url(base: &str, rel: &str) -> Option<String> {
+    let rel = rel.split('#').next().unwrap_or("").trim();
+    if rel.is_empty() {
+        return None;
+    }
+    let low = rel.to_ascii_lowercase();
+    if low.starts_with("javascript:")
+        || low.starts_with("mailto:")
+        || low.starts_with("tel:")
+        || low.starts_with("data:")
+    {
+        return None;
+    }
+    if low.starts_with("http://") || low.starts_with("https://") {
+        return Some(rel.to_string());
+    }
+    let scheme = scheme_of(base);
+    if scheme.is_empty() {
+        return None;
+    }
+    if let Some(rest) = rel.strip_prefix("//") {
+        return Some(format!("{scheme}://{rest}"));
+    }
+    let host = host_of(base);
+    if rel.starts_with('/') {
+        return Some(format!("{scheme}://{host}{rel}"));
+    }
+    Some(format!("{}{rel}", base_dir(base)))
+}
+
+/// Extract candidate link URLs from an HTML body's href / src / action
+/// attributes, resolved against `base`.
+pub fn extract_links(base: &str, html: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let mut out = Vec::new();
+    for attr in ["href", "src", "action"] {
+        let needle = attr.as_bytes();
+        let mut i = 0usize;
+        while let Some(rel_p) = lower[i..].find(attr) {
+            let p = i + rel_p;
+            i = p + needle.len();
+            // Word boundary before the attribute name.
+            if p > 0 && lb[p - 1].is_ascii_alphanumeric() {
+                continue;
+            }
+            let mut j = p + needle.len();
+            while j < lb.len() && lb[j] == b' ' {
+                j += 1;
+            }
+            if j >= lb.len() || lb[j] != b'=' {
+                continue;
+            }
+            j += 1;
+            while j < lb.len() && lb[j] == b' ' {
+                j += 1;
+            }
+            if j >= lb.len() {
+                break;
+            }
+            let (val, next) = if lb[j] == b'"' || lb[j] == b'\'' {
+                let q = lb[j];
+                let start = j + 1;
+                let mut e = start;
+                while e < lb.len() && lb[e] != q {
+                    e += 1;
+                }
+                (&html[start..e.min(html.len())], e + 1)
+            } else {
+                let start = j;
+                let mut e = start;
+                while e < lb.len() && !lb[e].is_ascii_whitespace() && lb[e] != b'>' {
+                    e += 1;
+                }
+                (&html[start..e.min(html.len())], e)
+            };
+            if let Some(abs) = resolve_url(base, val.trim()) {
+                if !out.contains(&abs) {
+                    out.push(abs);
+                }
+            }
+            i = next;
+        }
+    }
+    out
+}
+
+fn content_is_html(headers: &[(String, String)]) -> bool {
+    match header(headers, "content-type") {
+        Some(ct) => ct.to_ascii_lowercase().contains("html"),
+        None => true, // assume html when unstated
+    }
+}
+
+/// Collapse identical findings (same severity/title/detail), keeping the first;
+/// header weaknesses are usually site-wide, so this avoids one row per page.
+fn dedup_findings(fs: Vec<Finding>) -> Vec<Finding> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for f in fs {
+        if seen.insert(format!("{}\u{1}{}\u{1}{}", f.severity, f.title, f.detail)) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+pub struct CrawlResult {
+    pub pages: Vec<(String, u16)>, // (url, status) in fetch order
+    pub findings: Vec<Finding>,    // deduped audit findings across the pages
+}
+
+/// A bounded, same-origin, rate-limited crawl from `seed`. GET only; it reads
+/// each page, audits the response, and follows same-origin links up to
+/// `max_pages` / `max_depth`, sleeping `delay` between requests. Non-destructive.
+pub fn crawl(
+    seed: &str,
+    timeout: Duration,
+    max_pages: usize,
+    max_depth: u32,
+    delay: Duration,
+) -> CrawlResult {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+    visited.insert(strip_fragment(seed));
+    queue.push_back((seed.to_string(), 0));
+    let mut pages = Vec::new();
+    let mut findings = Vec::new();
+    while let Some((url, depth)) = queue.pop_front() {
+        if pages.len() >= max_pages {
+            break;
+        }
+        if !pages.is_empty() {
+            std::thread::sleep(delay); // rate limit between requests
+        }
+        let fetched = match fetch(&url, timeout) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        pages.push((url.clone(), fetched.status));
+        for f in audit_response(&url, fetched.status, &fetched.headers) {
+            if f.title != "HTTP response" {
+                findings.push(f);
+            }
+        }
+        if depth < max_depth && content_is_html(&fetched.headers) {
+            for link in extract_links(&url, &fetched.body) {
+                if !same_origin(seed, &link) {
+                    continue;
+                }
+                let key = strip_fragment(&link);
+                if !visited.contains(&key) && visited.len() < max_pages.saturating_mul(8) {
+                    visited.insert(key);
+                    queue.push_back((link, depth + 1));
+                }
+            }
+        }
+    }
+    CrawlResult {
+        pages,
+        findings: dedup_findings(findings),
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +411,80 @@ mod tests {
         let fs = audit_response("http://ex.com/", 200, &h(&[]));
         assert!(has(&fs, "Plaintext HTTP"));
         assert!(!has(&fs, "Missing HSTS")); // HSTS only applies to https
+    }
+
+    #[test]
+    fn resolves_links_of_each_shape() {
+        let b = "https://ex.com/app/page";
+        assert_eq!(
+            resolve_url(b, "https://other/x").as_deref(),
+            Some("https://other/x")
+        );
+        assert_eq!(
+            resolve_url(b, "//cdn.ex.com/j").as_deref(),
+            Some("https://cdn.ex.com/j")
+        );
+        assert_eq!(
+            resolve_url(b, "/login").as_deref(),
+            Some("https://ex.com/login")
+        );
+        assert_eq!(
+            resolve_url(b, "sub").as_deref(),
+            Some("https://ex.com/app/sub")
+        );
+        assert_eq!(
+            resolve_url(b, "x#frag").as_deref(),
+            Some("https://ex.com/app/x")
+        );
+        assert_eq!(resolve_url(b, "#top"), None);
+        assert_eq!(resolve_url(b, "javascript:void(0)"), None);
+        assert_eq!(resolve_url(b, "mailto:a@ex.com"), None);
+    }
+
+    #[test]
+    fn extracts_and_resolves_html_links() {
+        let html = r#"<a href="/a">A</a><a href='b/c'>B</a>
+                      <script src="https://cdn.ex.com/x.js"></script>
+                      <form action="/submit"><img src="data:xxx"></form>
+                      <a href="mailto:x@ex.com">m</a>"#;
+        let links = extract_links("https://ex.com/app/", html);
+        assert!(links.contains(&"https://ex.com/a".to_string()));
+        assert!(links.contains(&"https://ex.com/app/b/c".to_string()));
+        assert!(links.contains(&"https://cdn.ex.com/x.js".to_string()));
+        assert!(links.contains(&"https://ex.com/submit".to_string()));
+        assert!(!links
+            .iter()
+            .any(|l| l.starts_with("data:") || l.starts_with("mailto:")));
+    }
+
+    #[test]
+    fn same_origin_compares_scheme_and_host() {
+        assert!(same_origin("https://ex.com/a", "https://ex.com/b"));
+        assert!(!same_origin("https://ex.com/a", "http://ex.com/a"));
+        assert!(!same_origin("https://ex.com/a", "https://cdn.ex.com/a"));
+    }
+
+    #[test]
+    fn dedup_collapses_identical_findings() {
+        let fs = vec![
+            Finding::new(
+                "web",
+                "low",
+                "https://ex.com/1",
+                "Missing Content-Security-Policy",
+            )
+            .detail("no CSP".to_string()),
+            Finding::new(
+                "web",
+                "low",
+                "https://ex.com/2",
+                "Missing Content-Security-Policy",
+            )
+            .detail("no CSP".to_string()),
+            Finding::new("web", "medium", "https://ex.com/2", "Missing HSTS")
+                .detail("x".to_string()),
+        ];
+        assert_eq!(dedup_findings(fs).len(), 2);
     }
 
     #[test]
