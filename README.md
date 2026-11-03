@@ -81,6 +81,37 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 Heavier network capability (authenticated checks, templated probes) is out of
 scope for now, and exploitation / payload generation / C2 are **not** goals.
 
+## Detection matrix
+
+What a capture (`--file capture.pcap[ng]`) is scanned for. All of it is offline
+and passive — structure parsing only; nothing is decrypted that needs a secret
+key, and nothing is cracked. The finding `kind` / `severity` is what appears in
+the result JSON (`credential` / `auth` → `high`, `note` → `info`).
+
+| Source | What sanctum recovers | kind | severity |
+|---|---|---|---|
+| Any file | type (magic), CRC32 / MD5 / SHA-1 / SHA-256, entropy, strings | `note` | info |
+| Link / IP / transport | endpoints and destination services; Ethernet · VLAN / QinQ · MPLS · raw · Linux-SLL, IPv4 / IPv6 (+ ext-headers), TCP / UDP, IP-in-IP / GRE | `host` / `service` | info / low |
+| HTTP Basic / Digest | user : password (Basic), realm / nonce (Digest) | `credential` | high |
+| FTP / POP3 | `USER` / `PASS` | `credential` | high |
+| IMAP | `LOGIN` user / password | `credential` | high |
+| SMTP | AUTH PLAIN / LOGIN credentials | `credential` | high |
+| Web form | submitted password fields | `credential` | high |
+| Telnet | plaintext login / password | `credential` | high |
+| LDAP simple bind | bind DN + **cleartext password** | `credential` | high |
+| SNMP v1 / v2c | **community string** (device password) | `credential` | high |
+| TLS 1.2 / 1.3 | server name (SNI) | `note` | info |
+| QUIC v1 Initial | server name (SNI), after removing Initial protection (RFC 9001) | `note` | info |
+| NTLMSSP | domain \ user, workstation, server challenge, NetNTLMv1 / v2 presence | `auth` | high |
+| Kerberos | AS-REQ / AS-REP / TGS principal + realm; weak etype → Kerberoast / AS-REP-roast | `auth` | high |
+| RADIUS | cleartext User-Name, calling station, User-Password present; MS-CHAP (crackable) | `note` + `auth` | info / high |
+| SMB1 / SMB2 | SMB1 legacy, dialect, signing policy, SESSION_SETUP, TREE_CONNECT, CREATE paths | `note` | info |
+| LDAP (other) | SASL mechanism, StartTLS, SearchRequest base / filter / attributes | `note` | info |
+| DCE/RPC | bound interface UUID → service (DRSUAPI / DCSync, SVCCTL / task-sched exec, SPOOLSS / EFSRPC coercion, NETLOGON, SAMR / LSARPC) | `note` | info |
+
+Active scanning (`--scope`, opt-in) adds `host` / `service` findings from TCP
+connect host discovery, port enumeration and banner grabbing.
+
 ## Install
 
 ```sh
