@@ -141,16 +141,25 @@ pub fn audit_response(url: &str, status: u16, headers: &[(String, String)]) -> V
     out
 }
 
-/// One GET to `url`, following redirects, returning the final response's status
-/// and headers. Reads no body. Transport failures are a typed error string.
-pub fn fetch(url: &str, timeout: Duration) -> Result<Fetched, String> {
+const USER_AGENT: &str = concat!("sanctum/", env!("CARGO_PKG_VERSION"));
+
+/// Perform one request with the given method and redirect policy, capturing the
+/// response's status, headers and a bounded body.
+fn fetch_with(
+    url: &str,
+    timeout: Duration,
+    redirects: u32,
+    method: &str,
+) -> Result<Fetched, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(timeout)
-        .user_agent(concat!("sanctum/", env!("CARGO_PKG_VERSION")))
+        .redirects(redirects)
+        .user_agent(USER_AGENT)
         .build();
-    let resp = match agent.get(url).call() {
+    let resp = match agent.request(method, url).call() {
         Ok(r) => r,
-        // An HTTP error status still carries headers worth auditing.
+        // An HTTP error status (and, with redirects(0), a 3xx) still carries
+        // headers worth auditing.
         Err(ureq::Error::Status(_, r)) => r,
         Err(ureq::Error::Transport(t)) => return Err(t.to_string()),
     };
@@ -161,7 +170,6 @@ pub fn fetch(url: &str, timeout: Duration) -> Result<Fetched, String> {
             headers.push((name.to_ascii_lowercase(), value.to_string()));
         }
     }
-    // A bounded body read, only for link extraction during a crawl.
     let mut buf = Vec::new();
     resp.into_reader().take(BODY_CAP).read_to_end(&mut buf).ok();
     let body = String::from_utf8_lossy(&buf).into_owned();
@@ -170,6 +178,12 @@ pub fn fetch(url: &str, timeout: Duration) -> Result<Fetched, String> {
         headers,
         body,
     })
+}
+
+/// One GET to `url`, following redirects, returning the final response's status,
+/// headers and a bounded body. Transport failures are a typed error string.
+pub fn fetch(url: &str, timeout: Duration) -> Result<Fetched, String> {
+    fetch_with(url, timeout, 5, "GET")
 }
 
 // ---- bounded same-origin crawl (ADR 0001, non-destructive) -----------------
@@ -341,6 +355,9 @@ pub fn crawl(
             if f.title != "HTTP response" {
                 findings.push(f);
             }
+        }
+        for f in csrf_findings(&url, &fetched.body) {
+            findings.push(f); // passive; deduped site-wide below
         }
         if depth < max_depth && content_is_html(&fetched.headers) {
             for link in extract_links(&url, &fetched.body) {
@@ -699,6 +716,228 @@ pub fn sql_injection_scan(
     out
 }
 
+// ---- open-redirect detection (ADR 0001, non-destructive) --------------------
+//
+// Set a redirect-looking parameter to an external canary and see whether the
+// server issues a 3xx Location to it. We do NOT follow the redirect; the canary
+// host is a reserved .example domain that routes nowhere.
+
+const CANARY_HOST: &str = "sanctum-canary.example";
+const REDIRECT_PARAMS: &[&str] = &[
+    "url",
+    "next",
+    "redirect",
+    "redir",
+    "return",
+    "returnurl",
+    "return_url",
+    "dest",
+    "destination",
+    "continue",
+    "goto",
+    "to",
+    "u",
+    "r",
+    "callback",
+    "out",
+    "view",
+    "link",
+];
+
+/// Whether a parameter is a plausible redirect target (by name or value shape).
+pub fn is_redirect_param(name: &str, value: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    REDIRECT_PARAMS.contains(&n.as_str())
+        || value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("//")
+        || value.starts_with('/')
+}
+
+/// Whether a Location header points at our external canary host.
+pub fn location_targets_canary(location: &str) -> bool {
+    location.to_ascii_lowercase().contains(CANARY_HOST)
+}
+
+/// Probe redirect-looking parameters for open redirect. GET only, redirects not
+/// followed, deduped by path+name, capped and rate-limited.
+pub fn open_redirect_scan(
+    urls: &[String],
+    timeout: Duration,
+    delay: Duration,
+    max_probes: usize,
+) -> Vec<Finding> {
+    let canary = format!("https://{CANARY_HOST}/");
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut probes = 0usize;
+    for url in urls {
+        for (i, (name, value)) in query_params(url).iter().enumerate() {
+            if !is_redirect_param(name, value) {
+                continue;
+            }
+            if probes >= max_probes {
+                return out;
+            }
+            let path = url.split('?').next().unwrap_or(url);
+            if !seen.insert(format!("{path}\u{1}{name}\u{1}redir")) {
+                continue;
+            }
+            if probes > 0 {
+                std::thread::sleep(delay);
+            }
+            probes += 1;
+            let probe = set_param(url, i, &canary);
+            if let Ok(resp) = fetch_with(&probe, timeout, 0, "GET") {
+                if (300..400).contains(&resp.status) {
+                    if let Some(loc) = header(&resp.headers, "location") {
+                        if location_targets_canary(loc) {
+                            out.push(
+                                Finding::new("web", "high", url.clone(), "Open redirect candidate")
+                                    .detail(format!(
+                                        "parameter `{name}` redirects (Location) to an external host"
+                                    )),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---- directory / method enumeration (ADR 0001, non-destructive) -------------
+
+/// The origin root ("https://host/") of a URL.
+pub fn origin_root(url: &str) -> String {
+    format!("{}://{}/", scheme_of(url), host_of(url))
+}
+
+// Common sensitive paths and the severity if one is reachable.
+const SENSITIVE_PATHS: &[(&str, &str)] = &[
+    (".git/HEAD", "high"),
+    (".env", "high"),
+    (".svn/entries", "high"),
+    ("wp-config.php.bak", "high"),
+    ("backup.zip", "medium"),
+    ("backup.sql", "medium"),
+    ("server-status", "medium"),
+    ("phpinfo.php", "medium"),
+    (".htaccess", "medium"),
+    ("robots.txt", "info"),
+    (".well-known/security.txt", "info"),
+    ("admin/", "low"),
+];
+
+/// A finding for a probed sensitive path given its response status.
+pub fn dir_finding(path: &str, status: u16, sev: &str) -> Option<Finding> {
+    match status {
+        200 => Some(
+            Finding::new("web", sev, path.to_string(), "Exposed path")
+                .detail(format!("{path} is reachable (HTTP 200)")),
+        ),
+        401 | 403 => Some(
+            Finding::new(
+                "web",
+                "info",
+                path.to_string(),
+                "Path present but protected",
+            )
+            .detail(format!("{path} returned HTTP {status}")),
+        ),
+        _ => None,
+    }
+}
+
+/// Enumerate allowed methods (OPTIONS) and probe a small set of sensitive paths
+/// at the origin root. GET/OPTIONS only, rate-limited. Run once per origin.
+pub fn enum_scan(origin: &str, timeout: Duration, delay: Duration) -> Vec<Finding> {
+    let mut out = Vec::new();
+    // Method enumeration via OPTIONS (safe, idempotent).
+    if let Ok(resp) = fetch_with(origin, timeout, 0, "OPTIONS") {
+        if let Some(allow) = header(&resp.headers, "allow") {
+            out.push(
+                Finding::new("web", "info", origin.to_string(), "Allowed methods")
+                    .detail(format!("Allow: {allow}")),
+            );
+            if allow.to_ascii_uppercase().contains("TRACE") {
+                out.push(
+                    Finding::new("web", "medium", origin.to_string(), "HTTP TRACE advertised")
+                        .detail(
+                            "the Allow header lists TRACE (cross-site tracing risk)".to_string(),
+                        ),
+                );
+            }
+        }
+    }
+    // Directory probes.
+    for (path, sev) in SENSITIVE_PATHS {
+        std::thread::sleep(delay);
+        let url = format!("{origin}{path}");
+        if let Ok(resp) = fetch(&url, timeout) {
+            if let Some(f) = dir_finding(path, resp.status, sev) {
+                out.push(f);
+            }
+        }
+    }
+    out
+}
+
+// ---- CSRF token presence (ADR 0001, passive) --------------------------------
+
+const CSRF_TOKEN_HINTS: &[&str] = &[
+    "csrf",
+    "_token",
+    "authenticity_token",
+    "xsrf",
+    "nonce",
+    "__requestverificationtoken",
+];
+
+fn form_is_post(open_tag_lower: &str) -> bool {
+    match open_tag_lower.find("method") {
+        Some(p) => open_tag_lower[p..(p + 20).min(open_tag_lower.len())].contains("post"),
+        None => false,
+    }
+}
+
+/// Passive: report POST forms that carry no apparent CSRF token field.
+pub fn csrf_findings(url: &str, body: &str) -> Vec<Finding> {
+    let low = body.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    let mut form_no = 0usize;
+    while let Some(rel) = low[idx..].find("<form") {
+        let start = idx + rel;
+        let end = low[start..]
+            .find("</form>")
+            .map(|e| start + e + "</form>".len())
+            .unwrap_or(low.len());
+        let form = &low[start..end];
+        idx = end;
+        let open_tag = &form[..form.find('>').unwrap_or(form.len())];
+        if !form_is_post(open_tag) {
+            continue;
+        }
+        form_no += 1;
+        if !CSRF_TOKEN_HINTS.iter().any(|h| form.contains(h)) {
+            out.push(
+                Finding::new(
+                    "web",
+                    "low",
+                    url.to_string(),
+                    "POST form without apparent CSRF token",
+                )
+                .detail(format!(
+                    "form #{form_no} has no hidden token field (csrf / token / nonce / ...)"
+                )),
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,6 +1130,38 @@ mod tests {
         assert!(!timing_verdict(200, 3000, 500, t)); // confirmation fast -> jitter
         assert!(!timing_verdict(3000, 3000, 3000, t)); // slow baseline -> untrusted
         assert!(!timing_verdict(200, 1000, 1000, t)); // no delay
+    }
+
+    #[test]
+    fn redirect_param_and_canary_detection() {
+        assert!(is_redirect_param("next", "x"));
+        assert!(is_redirect_param("anything", "https://evil/"));
+        assert!(is_redirect_param("q", "/path"));
+        assert!(!is_redirect_param("q", "hello"));
+        assert!(location_targets_canary("https://sanctum-canary.example/"));
+        assert!(location_targets_canary("//sanctum-canary.example/x"));
+        assert!(!location_targets_canary("https://ex.com/home"));
+    }
+
+    #[test]
+    fn dir_finding_by_status() {
+        assert_eq!(dir_finding(".env", 200, "high").unwrap().severity, "high");
+        assert_eq!(
+            dir_finding(".git/HEAD", 403, "high").unwrap().severity,
+            "info"
+        );
+        assert!(dir_finding(".env", 404, "high").is_none());
+        assert_eq!(origin_root("https://ex.com/a/b?x=1"), "https://ex.com/");
+    }
+
+    #[test]
+    fn csrf_flags_post_form_without_token() {
+        let body = r#"<form method="POST" action="/pay"><input name="amount"></form>
+                      <form method="post"><input type="hidden" name="csrf_token" value="z"></form>
+                      <form method="get"><input name="q"></form>"#;
+        let fs = csrf_findings("https://ex.com/", body);
+        assert_eq!(fs.len(), 1); // only the first POST form lacks a token; GET form ignored
+        assert!(fs[0].title.contains("CSRF"));
     }
 
     #[test]

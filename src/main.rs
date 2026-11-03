@@ -556,6 +556,10 @@ fn run_web(args: &Args, url: &str) -> i32 {
                 for f in web::audit_response(url, resp.status, &resp.headers) {
                     report.findings.push(f);
                 }
+                // CSRF token presence is passive (reads the body we already have).
+                for f in web::csrf_findings(url, &resp.body) {
+                    report.findings.push(f);
+                }
             }
             Err(e) => {
                 report.warnings.push(format!("web: request failed: {e}"));
@@ -583,6 +587,13 @@ fn run_web(args: &Args, url: &str) -> i32 {
             report.findings.push(f);
         }
         for f in web::sql_injection_scan(&candidates, timeout, delay, WEB_MAX_PROBES) {
+            report.findings.push(f);
+        }
+        for f in web::open_redirect_scan(&candidates, timeout, delay, WEB_MAX_PROBES) {
+            report.findings.push(f);
+        }
+        // Directory / method enumeration runs once against the origin root.
+        for f in web::enum_scan(&web::origin_root(url), timeout, delay) {
             report.findings.push(f);
         }
     }
@@ -698,10 +709,11 @@ OPTIONS:
                          cookie flags, software disclosure and transport posture.
     --crawl              With --web: follow same-origin links and audit each page
                          (bounded, rate-limited; non-destructive).
-    --active             With --web: non-destructive active detection - probe
-                         query parameters for reflected XSS (benign marker) and
-                         SQL injection (error- and bounded time-based; existence
-                         only, no data read). Rate-limited and capped.
+    --active             With --web: non-destructive active detection - reflected
+                         XSS (benign marker), SQL injection (error- and bounded
+                         time-based, existence only), open redirect, and
+                         directory / method enumeration. Rate-limited and capped.
+                         (CSRF-token presence is checked passively, always.)
     --max-pages <N>      Crawl page cap (default 20).
     --i-am-authorized    Confirm you are authorized to test the scope (required).
     --json <PATH>        Write the result JSON here (Zume passes {out}); else stdout.

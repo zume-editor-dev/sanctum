@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.17)
+## What it does (v0.18)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -92,8 +92,13 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   error a clean response lacked) and **time-based** (a bounded `SLEEP`/`pg_sleep`/
   `WAITFOR` payload delays the response, confirmed with a second probe to shed
   jitter) — reporting the parameter as a high-severity candidate. **Existence
-  only: no data is ever read.** Later increments add open-redirect / directory
-  detection.
+  only: no data is ever read.** It also checks **open redirect** (a
+  redirect-looking parameter that sends a 3xx `Location` to an external canary),
+  enumerates **allowed methods** (OPTIONS `Allow`, flagging TRACE) and probes a
+  small set of **sensitive paths** (`.git/HEAD`, `.env`, backups, `server-status`,
+  …) at the origin root (v0.18). Separately, **CSRF-token presence** is checked
+  **passively** (always): a POST form with no apparent hidden token field is
+  flagged.
 - Emits **result format v1** JSON that the editor lists and can act on.
 
 Exploitation, payload / shellcode generation, C2, data extraction (e.g. sqlmap
@@ -143,6 +148,10 @@ connect host discovery, port enumeration and banner grabbing. Web diagnostics
 | Reflected input (`--active`) | a query parameter reflected but HTML-encoded | info |
 | SQLi error-based (`--active`) | a single quote surfaces a DB error (MySQL / MSSQL / PostgreSQL / Oracle / SQLite) | high |
 | SQLi time-based (`--active`) | a bounded sleep payload delays the response (confirmed twice) | high |
+| Open redirect (`--active`) | a redirect parameter sends a 3xx Location to an external canary | high |
+| Method enumeration (`--active`) | OPTIONS `Allow` methods; TRACE advertised | info / medium |
+| Sensitive paths (`--active`) | `.git/HEAD`, `.env`, backups, `server-status`, … reachable at the root | high / medium / info |
+| CSRF (passive) | a POST form with no apparent hidden token field | low |
 
 ## Install
 
