@@ -65,6 +65,9 @@ struct Args {
     banner: bool,
     crawl: bool,
     active: bool,
+    fuzz: bool,
+    auth_cookie: Option<String>,
+    auth_headers: Vec<String>,
     max_pages: usize,
     help: bool,
 }
@@ -85,10 +88,32 @@ impl Default for Args {
             banner: true,
             crawl: false,
             active: false,
+            fuzz: false,
+            auth_cookie: None,
+            auth_headers: Vec::new(),
             max_pages: DEFAULT_MAX_PAGES,
             help: false,
         }
     }
+}
+
+/// Build the operator-supplied request headers for authenticated scanning
+/// (ADR 0002). `--auth-cookie` becomes a `Cookie` header; each `--auth-header`
+/// is `Name: Value`. These are a secret: the caller must never log or emit them.
+fn build_auth_headers(args: &Args) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    if let Some(c) = &args.auth_cookie {
+        out.push(("Cookie".to_string(), c.clone()));
+    }
+    for h in &args.auth_headers {
+        match h.split_once(':') {
+            Some((name, value)) if !name.trim().is_empty() => {
+                out.push((name.trim().to_string(), value.trim().to_string()))
+            }
+            _ => return Err(format!("--auth-header needs 'Name: Value': {h}")),
+        }
+    }
+    Ok(out)
 }
 
 fn main() {
@@ -509,6 +534,19 @@ fn run_web(args: &Args, url: &str) -> i32 {
         return 3;
     }
 
+    // Authenticated scanning (ADR 0002): operator-supplied session headers.
+    // Build them before anything runs so a malformed --auth-header fails early.
+    let auth = match build_auth_headers(args) {
+        Ok(h) => h,
+        Err(e) => {
+            report.warnings.push(format!("web: {e}"));
+            report.finished = timefmt::iso8601_now();
+            write_result(&report, args);
+            eprintln!("sanctum: {e}");
+            return 2;
+        }
+    };
+
     audit::log(
         &audit,
         &format!(
@@ -517,6 +555,19 @@ fn run_web(args: &Args, url: &str) -> i32 {
             args.crawl
         ),
     );
+    // The session material is a secret: log only that auth was supplied and how
+    // many headers, never the cookie or token value.
+    if !auth.is_empty() {
+        audit::log(
+            &audit,
+            &format!(
+                "{started} web_auth url={} cookie={} headers={}",
+                result::jstr(url),
+                args.auth_cookie.is_some() as u8,
+                auth.len()
+            ),
+        );
+    }
     // Web responses need more headroom than a TCP connect; honor an explicit
     // --timeout-ms but floor it so a default 800 ms does not spuriously fail.
     let timeout = Duration::from_millis(args.timeout_ms.max(5000));
@@ -531,6 +582,7 @@ fn run_web(args: &Args, url: &str) -> i32 {
             args.max_pages,
             WEB_CRAWL_DEPTH,
             Duration::from_millis(WEB_CRAWL_DELAY_MS),
+            &auth,
         );
         report.findings.push(
             Finding::new("web", "info", url.to_string(), "Crawl summary").detail(format!(
@@ -551,7 +603,7 @@ fn run_web(args: &Args, url: &str) -> i32 {
             report.findings.push(f);
         }
     } else {
-        match web::fetch(url, timeout) {
+        match web::fetch(url, timeout, &auth) {
             Ok(resp) => {
                 for f in web::audit_response(url, resp.status, &resp.headers) {
                     report.findings.push(f);
@@ -577,23 +629,46 @@ fn run_web(args: &Args, url: &str) -> i32 {
     }
     // Active, non-destructive detection (--active): reflected-XSS probing of
     // query parameters (ADR 0001 increment 2).
+    let delay = Duration::from_millis(WEB_CRAWL_DELAY_MS);
     if args.active {
         audit::log(
             &audit,
             &format!("{started} web_active url={}", result::jstr(url)),
         );
-        let delay = Duration::from_millis(WEB_CRAWL_DELAY_MS);
-        for f in web::reflected_xss_scan(&candidates, timeout, delay, WEB_MAX_PROBES) {
+        for f in web::reflected_xss_scan(&candidates, timeout, delay, WEB_MAX_PROBES, &auth) {
             report.findings.push(f);
         }
-        for f in web::sql_injection_scan(&candidates, timeout, delay, WEB_MAX_PROBES) {
+        for f in web::sql_injection_scan(&candidates, timeout, delay, WEB_MAX_PROBES, &auth) {
             report.findings.push(f);
         }
-        for f in web::open_redirect_scan(&candidates, timeout, delay, WEB_MAX_PROBES) {
+        for f in web::command_injection_scan(&candidates, timeout, delay, WEB_MAX_PROBES, &auth) {
+            report.findings.push(f);
+        }
+        for f in web::path_traversal_scan(&candidates, timeout, delay, WEB_MAX_PROBES, &auth) {
+            report.findings.push(f);
+        }
+        for f in web::crlf_injection_scan(&candidates, timeout, delay, WEB_MAX_PROBES, &auth) {
+            report.findings.push(f);
+        }
+        for f in web::open_redirect_scan(&candidates, timeout, delay, WEB_MAX_PROBES, &auth) {
             report.findings.push(f);
         }
         // Directory / method enumeration runs once against the origin root.
-        for f in web::enum_scan(&web::origin_root(url), timeout, delay) {
+        for f in web::enum_scan(&web::origin_root(url), timeout, delay, &auth) {
+            report.findings.push(f);
+        }
+    }
+    // Non-destructive fuzzing (ADR 0002): bounded input mutation + hidden-
+    // parameter discovery. Reports response anomalies, never a flood or crash.
+    if args.fuzz {
+        audit::log(
+            &audit,
+            &format!("{started} web_fuzz url={}", result::jstr(url)),
+        );
+        for f in web::fuzz_scan(&candidates, timeout, delay, WEB_MAX_PROBES, &auth) {
+            report.findings.push(f);
+        }
+        for f in web::hidden_param_scan(&candidates, timeout, delay, WEB_MAX_PROBES, &auth) {
             report.findings.push(f);
         }
     }
@@ -659,6 +734,11 @@ fn parse_args() -> Result<Args, String> {
             "--no-banner" => args.banner = false,
             "--crawl" => args.crawl = true,
             "--active" => args.active = true,
+            "--fuzz" => args.fuzz = true,
+            "--auth-cookie" => args.auth_cookie = Some(need_value(&mut it, "--auth-cookie")?),
+            "--auth-header" => args
+                .auth_headers
+                .push(need_value(&mut it, "--auth-header")?),
             "--max-pages" => {
                 args.max_pages = need_value(&mut it, "--max-pages")?
                     .parse()
@@ -693,7 +773,8 @@ USAGE:
     Offline file analysis (tier T0, no network):
       sanctum --file <PATH> [--json <PATH>] [--audit <PATH>]
     Web diagnostics (tier T2, non-destructive):
-      sanctum --web <URL> --i-am-authorized [--crawl] [--active] [--max-pages <N>]
+      sanctum --web <URL> --i-am-authorized [--crawl] [--active] [--fuzz]
+              [--auth-cookie <V>] [--auth-header <NAME: VALUE>] [--max-pages <N>]
               [--json <PATH>] [--audit <PATH>] [--timeout-ms <N>]
 
 AUTHORIZED USE ONLY. Active work (--scope, --web) is refused without
@@ -711,9 +792,22 @@ OPTIONS:
                          (bounded, rate-limited; non-destructive).
     --active             With --web: non-destructive active detection - reflected
                          XSS (benign marker), SQL injection (error- and bounded
-                         time-based, existence only), open redirect, and
-                         directory / method enumeration. Rate-limited and capped.
-                         (CSRF-token presence is checked passively, always.)
+                         time-based), OS command injection (bounded time-based),
+                         path traversal (structural signature; contents never
+                         shown), CRLF / response-header injection, open redirect,
+                         and directory / method enumeration. Existence only:
+                         nothing is exploited, read or extracted. Capped and
+                         rate-limited. (CSRF-token presence is checked passively.)
+    --fuzz               With --web: non-destructive fuzzing - bounded input
+                         mutation reporting response anomalies (status / error /
+                         length change, template-evaluation = SSTI existence) and
+                         hidden-parameter discovery. Never a flood or a crash
+                         attempt; capped and rate-limited.
+    --auth-cookie <V>    With --web: send this value as the Cookie header on every
+                         request (authenticated scanning - you supply your own
+                         session; sanctum never logs in). Never logged or emitted.
+    --auth-header <H>    With --web: an extra request header, \"Name: Value\"
+                         (repeatable; e.g. a bearer token). Never logged or emitted.
     --max-pages <N>      Crawl page cap (default 20).
     --i-am-authorized    Confirm you are authorized to test the scope (required).
     --json <PATH>        Write the result JSON here (Zume passes {out}); else stdout.

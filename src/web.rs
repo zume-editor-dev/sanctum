@@ -144,19 +144,26 @@ pub fn audit_response(url: &str, status: u16, headers: &[(String, String)]) -> V
 const USER_AGENT: &str = concat!("sanctum/", env!("CARGO_PKG_VERSION"));
 
 /// Perform one request with the given method and redirect policy, capturing the
-/// response's status, headers and a bounded body.
+/// response's status, headers and a bounded body. `extra` carries any
+/// operator-supplied request headers (authenticated scanning, ADR 0002); they
+/// flow only into the outgoing request and are never logged or emitted.
 fn fetch_with(
     url: &str,
     timeout: Duration,
     redirects: u32,
     method: &str,
+    extra: &[(String, String)],
 ) -> Result<Fetched, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(timeout)
         .redirects(redirects)
         .user_agent(USER_AGENT)
         .build();
-    let resp = match agent.request(method, url).call() {
+    let mut req = agent.request(method, url);
+    for (name, value) in extra {
+        req = req.set(name, value);
+    }
+    let resp = match req.call() {
         Ok(r) => r,
         // An HTTP error status (and, with redirects(0), a 3xx) still carries
         // headers worth auditing.
@@ -181,9 +188,10 @@ fn fetch_with(
 }
 
 /// One GET to `url`, following redirects, returning the final response's status,
-/// headers and a bounded body. Transport failures are a typed error string.
-pub fn fetch(url: &str, timeout: Duration) -> Result<Fetched, String> {
-    fetch_with(url, timeout, 5, "GET")
+/// headers and a bounded body. `extra` carries operator-supplied request headers
+/// (empty for an anonymous scan). Transport failures are a typed error string.
+pub fn fetch(url: &str, timeout: Duration, extra: &[(String, String)]) -> Result<Fetched, String> {
+    fetch_with(url, timeout, 5, "GET", extra)
 }
 
 // ---- bounded same-origin crawl (ADR 0001, non-destructive) -----------------
@@ -318,6 +326,36 @@ fn dedup_findings(fs: Vec<Finding>) -> Vec<Finding> {
     out
 }
 
+// Link path fragments that suggest following the link could change state. The
+// crawl skips a *discovered* link matching any of these so a GET - especially an
+// authenticated one (ADR 0002) - never logs the session out or triggers an
+// action. The operator-chosen seed is always fetched.
+const DESTRUCTIVE_HINTS: &[&str] = &[
+    "logout",
+    "log-out",
+    "signout",
+    "sign-out",
+    "delete",
+    "remove",
+    "destroy",
+    "deactivate",
+    "disable",
+    "shutdown",
+    "reboot",
+    "purge",
+    "revoke",
+    "unsubscribe",
+    "/drop",
+    "=delete",
+    "action=delete",
+];
+
+/// Whether following `url` could plausibly change server state (by path/query).
+pub fn is_destructive_link(url: &str) -> bool {
+    let low = url.to_ascii_lowercase();
+    DESTRUCTIVE_HINTS.iter().any(|h| low.contains(h))
+}
+
 pub struct CrawlResult {
     pub pages: Vec<(String, u16)>, // (url, status) in fetch order
     pub findings: Vec<Finding>,    // deduped audit findings across the pages
@@ -325,13 +363,16 @@ pub struct CrawlResult {
 
 /// A bounded, same-origin, rate-limited crawl from `seed`. GET only; it reads
 /// each page, audits the response, and follows same-origin links up to
-/// `max_pages` / `max_depth`, sleeping `delay` between requests. Non-destructive.
+/// `max_pages` / `max_depth`, sleeping `delay` between requests. Discovered
+/// destructive-looking links are skipped. `extra` carries operator-supplied
+/// request headers (authenticated scanning). Non-destructive.
 pub fn crawl(
     seed: &str,
     timeout: Duration,
     max_pages: usize,
     max_depth: u32,
     delay: Duration,
+    extra: &[(String, String)],
 ) -> CrawlResult {
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<(String, u32)> = VecDeque::new();
@@ -346,7 +387,7 @@ pub fn crawl(
         if !pages.is_empty() {
             std::thread::sleep(delay); // rate limit between requests
         }
-        let fetched = match fetch(&url, timeout) {
+        let fetched = match fetch(&url, timeout, extra) {
             Ok(f) => f,
             Err(_) => continue,
         };
@@ -363,6 +404,9 @@ pub fn crawl(
             for link in extract_links(&url, &fetched.body) {
                 if !same_origin(seed, &link) {
                     continue;
+                }
+                if is_destructive_link(&link) {
+                    continue; // never follow a state-changing link (ADR 0002)
                 }
                 let key = strip_fragment(&link);
                 if !visited.contains(&key) && visited.len() < max_pages.saturating_mul(8) {
@@ -393,13 +437,18 @@ pub enum Reflection {
     Raw,     // the raw '<' survived next to the marker - injection is possible
 }
 
-/// A unique, alphanumeric probe marker for this process/run.
-fn marker() -> String {
+/// A unique, alphanumeric token for this process/run, with a given prefix.
+fn unique_token(prefix: &str) -> String {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("sanctumxss{:x}", (n as u64) & 0xff_ffff_ffff)
+    format!("{prefix}{:x}", (n as u64) & 0xff_ffff_ffff)
+}
+
+/// A unique, alphanumeric probe marker for this process/run.
+fn marker() -> String {
+    unique_token("sanctumxss")
 }
 
 /// Percent-encode a query value (everything but RFC 3986 unreserved).
@@ -503,6 +552,7 @@ pub fn reflected_xss_scan(
     timeout: Duration,
     delay: Duration,
     max_probes: usize,
+    extra: &[(String, String)],
 ) -> Vec<Finding> {
     let mark = marker();
     let probe_value = format!("{mark}<>\"'");
@@ -524,7 +574,7 @@ pub fn reflected_xss_scan(
             }
             probes += 1;
             let probe_url = set_param(url, i, &probe_value);
-            if let Ok(resp) = fetch(&probe_url, timeout) {
+            if let Ok(resp) = fetch(&probe_url, timeout, extra) {
                 if let Some(f) = xss_finding(url, name, detect_reflection(&mark, &resp.body)) {
                     out.push(f);
                 }
@@ -621,6 +671,7 @@ pub fn sql_injection_scan(
     timeout: Duration,
     delay: Duration,
     max_probes: usize,
+    extra: &[(String, String)],
 ) -> Vec<Finding> {
     let time_payloads = [
         format!("' AND SLEEP({SQL_SLEEP_SECONDS})-- -"),
@@ -637,7 +688,7 @@ pub fn sql_injection_scan(
             continue;
         }
         let t0 = Instant::now();
-        let baseline = fetch(url, timeout).ok();
+        let baseline = fetch(url, timeout, extra).ok();
         let base_ms = t0.elapsed().as_millis();
         let base_has_err = baseline
             .as_ref()
@@ -659,7 +710,7 @@ pub fn sql_injection_scan(
             probes += 1;
             let mut flagged = false;
             let err_url = set_param(url, i, &format!("{decoded}'"));
-            if let Ok(r) = fetch(&err_url, timeout) {
+            if let Ok(r) = fetch(&err_url, timeout, extra) {
                 if !base_has_err {
                     if let Some(db) = sql_error_signature(&r.body) {
                         out.push(
@@ -689,7 +740,7 @@ pub fn sql_injection_scan(
                 probes += 1;
                 let u = set_param(url, i, &format!("{decoded}{payload}"));
                 let t = Instant::now();
-                let ok1 = fetch(&u, timeout).is_ok();
+                let ok1 = fetch(&u, timeout, extra).is_ok();
                 let ms1 = t.elapsed().as_millis();
                 if !ok1 || ms1 < SQL_TIME_THRESHOLD_MS {
                     continue;
@@ -699,7 +750,7 @@ pub fn sql_injection_scan(
                 }
                 probes += 1;
                 let t2 = Instant::now();
-                let ok2 = fetch(&u, timeout).is_ok();
+                let ok2 = fetch(&u, timeout, extra).is_ok();
                 let ms2 = t2.elapsed().as_millis();
                 if ok2 && timing_verdict(base_ms, ms1, ms2, SQL_TIME_THRESHOLD_MS) {
                     out.push(
@@ -766,6 +817,7 @@ pub fn open_redirect_scan(
     timeout: Duration,
     delay: Duration,
     max_probes: usize,
+    extra: &[(String, String)],
 ) -> Vec<Finding> {
     let canary = format!("https://{CANARY_HOST}/");
     let mut out = Vec::new();
@@ -788,7 +840,7 @@ pub fn open_redirect_scan(
             }
             probes += 1;
             let probe = set_param(url, i, &canary);
-            if let Ok(resp) = fetch_with(&probe, timeout, 0, "GET") {
+            if let Ok(resp) = fetch_with(&probe, timeout, 0, "GET", extra) {
                 if (300..400).contains(&resp.status) {
                     if let Some(loc) = header(&resp.headers, "location") {
                         if location_targets_canary(loc) {
@@ -852,10 +904,15 @@ pub fn dir_finding(path: &str, status: u16, sev: &str) -> Option<Finding> {
 
 /// Enumerate allowed methods (OPTIONS) and probe a small set of sensitive paths
 /// at the origin root. GET/OPTIONS only, rate-limited. Run once per origin.
-pub fn enum_scan(origin: &str, timeout: Duration, delay: Duration) -> Vec<Finding> {
+pub fn enum_scan(
+    origin: &str,
+    timeout: Duration,
+    delay: Duration,
+    extra: &[(String, String)],
+) -> Vec<Finding> {
     let mut out = Vec::new();
     // Method enumeration via OPTIONS (safe, idempotent).
-    if let Ok(resp) = fetch_with(origin, timeout, 0, "OPTIONS") {
+    if let Ok(resp) = fetch_with(origin, timeout, 0, "OPTIONS", extra) {
         if let Some(allow) = header(&resp.headers, "allow") {
             out.push(
                 Finding::new("web", "info", origin.to_string(), "Allowed methods")
@@ -875,7 +932,7 @@ pub fn enum_scan(origin: &str, timeout: Duration, delay: Duration) -> Vec<Findin
     for (path, sev) in SENSITIVE_PATHS {
         std::thread::sleep(delay);
         let url = format!("{origin}{path}");
-        if let Ok(resp) = fetch(&url, timeout) {
+        if let Ok(resp) = fetch(&url, timeout, extra) {
             if let Some(f) = dir_finding(path, resp.status, sev) {
                 out.push(f);
             }
@@ -933,6 +990,521 @@ pub fn csrf_findings(url: &str, body: &str) -> Vec<Finding> {
                     "form #{form_no} has no hidden token field (csrf / token / nonce / ...)"
                 )),
             );
+        }
+    }
+    out
+}
+
+// ---- OS command injection detection (time-based, existence only; ADR 0002) --
+//
+// Inject a *benign* delay command (only ever a sleep) into a parameter and
+// confirm a measured delay, twice, to shed jitter - the time-based SQLi pattern.
+// This establishes that a parameter reaches a shell without running a harmful
+// command and without reading any output.
+
+const CMD_SLEEP_SECONDS: u64 = 3;
+
+/// Benign delay payloads (a sleep only) for time-based command-injection
+/// existence detection. `sleep` covers POSIX shells; `ping`/`timeout` Windows.
+fn cmd_time_payloads() -> Vec<String> {
+    let s = CMD_SLEEP_SECONDS;
+    vec![
+        format!(";sleep {s}"),
+        format!("|sleep {s}"),
+        format!("`sleep {s}`"),
+        format!("$(sleep {s})"),
+        format!("& ping -n {} 127.0.0.1", s + 1), // Windows ping delays ~(n-1)s
+        format!("& timeout /t {s}"),
+    ]
+}
+
+/// Probe query parameters for OS command injection (time-based, existence only).
+/// GET only, deduped by path+name, capped, rate-limited. Non-destructive: the
+/// only command ever injected is a sleep, and no output is read.
+pub fn command_injection_scan(
+    urls: &[String],
+    timeout: Duration,
+    delay: Duration,
+    max_probes: usize,
+    extra: &[(String, String)],
+) -> Vec<Finding> {
+    let payloads = cmd_time_payloads();
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut probes = 0usize;
+    for url in urls {
+        let params = query_params(url);
+        if params.is_empty() {
+            continue;
+        }
+        let t0 = Instant::now();
+        let _ = fetch(url, timeout, extra);
+        let base_ms = t0.elapsed().as_millis();
+        if base_ms >= SQL_BASE_MAX_MS {
+            continue; // baseline too slow to trust timing (same bar as SQLi)
+        }
+        for (i, (name, value)) in params.iter().enumerate() {
+            if probes >= max_probes {
+                return out;
+            }
+            let path = url.split('?').next().unwrap_or(url);
+            if !seen.insert(format!("{path}\u{1}{name}\u{1}cmd")) {
+                continue;
+            }
+            let decoded = pct_decode(value);
+            for payload in &payloads {
+                if probes >= max_probes {
+                    return out;
+                }
+                std::thread::sleep(delay);
+                probes += 1;
+                let u = set_param(url, i, &format!("{decoded}{payload}"));
+                let t = Instant::now();
+                let ok1 = fetch(&u, timeout, extra).is_ok();
+                let ms1 = t.elapsed().as_millis();
+                if !ok1 || ms1 < SQL_TIME_THRESHOLD_MS {
+                    continue;
+                }
+                if probes >= max_probes {
+                    return out;
+                }
+                std::thread::sleep(delay);
+                probes += 1;
+                let t2 = Instant::now();
+                let ok2 = fetch(&u, timeout, extra).is_ok();
+                let ms2 = t2.elapsed().as_millis();
+                if ok2 && timing_verdict(base_ms, ms1, ms2, SQL_TIME_THRESHOLD_MS) {
+                    out.push(
+                        Finding::new(
+                            "web",
+                            "high",
+                            url.clone(),
+                            "OS command injection (time-based) candidate",
+                        )
+                        .detail(format!(
+                            "parameter `{name}` delayed ~{CMD_SLEEP_SECONDS}s on a benign sleep payload"
+                        )),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---- path traversal detection (structural-signature existence; ADR 0002) ----
+//
+// Send a traversal payload and match only a well-known *structural, non-secret*
+// signature to confirm the flaw. The finding reports existence and which
+// signature matched - never file contents, and no secret-bearing file is read.
+
+const TRAVERSAL_PAYLOADS: &[&str] = &[
+    "../../../../../../etc/passwd",
+    "....//....//....//....//....//etc/passwd",
+    "/etc/passwd",
+    "../../../../../../../../windows/win.ini",
+    "..\\..\\..\\..\\..\\..\\windows\\win.ini",
+];
+
+/// A well-known structural, non-secret signature in `body` that confirms a
+/// traversal read occurred; returns the signature's name, never any contents.
+pub fn traversal_signature(body: &str) -> Option<&'static str> {
+    // A unix passwd line has 7 colon-separated fields; we match the shape and a
+    // conventional account name, not any secret value.
+    if body.lines().any(|l| {
+        l.matches(':').count() >= 6
+            && (l.starts_with("root:") || l.starts_with("daemon:") || l.starts_with("nobody:"))
+    }) {
+        return Some("unix passwd structure");
+    }
+    let low = body.to_ascii_lowercase();
+    if low.contains("[extensions]") || low.contains("; for 16-bit app support") {
+        return Some("windows win.ini structure");
+    }
+    None
+}
+
+/// Probe query parameters for path traversal (structural-signature existence).
+/// GET only, deduped, capped, rate-limited; reports existence only.
+pub fn path_traversal_scan(
+    urls: &[String],
+    timeout: Duration,
+    delay: Duration,
+    max_probes: usize,
+    extra: &[(String, String)],
+) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut probes = 0usize;
+    for url in urls {
+        let params = query_params(url);
+        if params.is_empty() {
+            continue;
+        }
+        // Only trust a signature the clean page did not already show.
+        let base_has_sig = fetch(url, timeout, extra)
+            .ok()
+            .map(|r| traversal_signature(&r.body).is_some())
+            .unwrap_or(false);
+        if base_has_sig {
+            continue;
+        }
+        for (i, (name, _)) in params.iter().enumerate() {
+            if probes >= max_probes {
+                return out;
+            }
+            let path = url.split('?').next().unwrap_or(url);
+            if !seen.insert(format!("{path}\u{1}{name}\u{1}trav")) {
+                continue;
+            }
+            for payload in TRAVERSAL_PAYLOADS {
+                if probes >= max_probes {
+                    return out;
+                }
+                std::thread::sleep(delay);
+                probes += 1;
+                let u = set_param(url, i, payload);
+                if let Ok(r) = fetch(&u, timeout, extra) {
+                    if let Some(sig) = traversal_signature(&r.body) {
+                        out.push(
+                            Finding::new("web", "high", url.clone(), "Path traversal candidate")
+                                .detail(format!(
+                                    "parameter `{name}` returned a {sig} (traversal confirmed; \
+                                 contents not shown)"
+                                )),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---- CRLF / HTTP response-header injection (existence; ADR 0002) ------------
+//
+// Inject a CR LF plus a benign, inert marker header into a parameter and detect
+// the marker coming back as a real response header. Nothing is cached or poisoned.
+
+const CRLF_HEADER: &str = "x-sanctum-inject";
+const CRLF_VALUE: &str = "1";
+
+/// Whether the inert marker header is present in a response's headers.
+pub fn response_has_injected_header(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(k, v)| k == CRLF_HEADER && v == CRLF_VALUE)
+}
+
+/// Probe query parameters for CRLF / response-header injection. GET only,
+/// redirects not followed, deduped, capped, rate-limited. Non-destructive.
+pub fn crlf_injection_scan(
+    urls: &[String],
+    timeout: Duration,
+    delay: Duration,
+    max_probes: usize,
+    extra: &[(String, String)],
+) -> Vec<Finding> {
+    let tail = format!("\r\n{CRLF_HEADER}: {CRLF_VALUE}");
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut probes = 0usize;
+    for url in urls {
+        for (i, (name, value)) in query_params(url).iter().enumerate() {
+            if probes >= max_probes {
+                return out;
+            }
+            let path = url.split('?').next().unwrap_or(url);
+            if !seen.insert(format!("{path}\u{1}{name}\u{1}crlf")) {
+                continue;
+            }
+            if probes > 0 {
+                std::thread::sleep(delay);
+            }
+            probes += 1;
+            let decoded = pct_decode(value);
+            // set_param percent-encodes the CR/LF to %0D%0A on the wire.
+            let u = set_param(url, i, &format!("{decoded}{tail}"));
+            if let Ok(r) = fetch_with(&u, timeout, 0, "GET", extra) {
+                if response_has_injected_header(&r.headers) {
+                    out.push(
+                        Finding::new(
+                            "web",
+                            "high",
+                            url.clone(),
+                            "CRLF / response-header injection candidate",
+                        )
+                        .detail(format!(
+                            "parameter `{name}` injected a response header via CR LF"
+                        )),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---- non-destructive fuzzing (ADR 0002) -------------------------------------
+//
+// Bounded input mutation that classifies response *differences* - never a flood
+// or a crash attempt. A curated benign payload set per parameter (including a
+// template-evaluation marker for SSTI existence), plus hidden-parameter
+// discovery. Each is capped by the shared probe budget and rate-limited.
+
+const SSTI_PRODUCT: &str = "1787569"; // 1337 * 1337 - too specific to occur by chance
+const SSTI_PAYLOADS: &[&str] = &[
+    "{{1337*1337}}",
+    "${1337*1337}",
+    "#{1337*1337}",
+    "<%= 1337*1337 %>",
+    "${{1337*1337}}",
+];
+
+/// Whether a template expression evaluated (SSTI existence) in `body`.
+pub fn detect_ssti(body: &str) -> bool {
+    body.contains(SSTI_PRODUCT)
+}
+
+/// A response reduced to the shape the fuzzer compares against a baseline.
+pub struct RespShape {
+    pub status_class: u16, // the status / 100 (2,3,4,5)
+    pub len: usize,
+    pub sql_error: bool,
+}
+
+/// Reduce a response to its shape.
+pub fn shape_of(status: u16, body: &str) -> RespShape {
+    RespShape {
+        status_class: status / 100,
+        len: body.len(),
+        sql_error: sql_error_signature(body).is_some(),
+    }
+}
+
+/// Classify how a probe response differs from the baseline; None = no anomaly.
+/// Returns (severity, detail).
+pub fn classify_anomaly(base: &RespShape, probe: &RespShape) -> Option<(String, String)> {
+    if probe.sql_error && !base.sql_error {
+        return Some((
+            "high".to_string(),
+            "input surfaced a database error".to_string(),
+        ));
+    }
+    if probe.status_class == 5 && base.status_class != 5 {
+        return Some((
+            "medium".to_string(),
+            "input changed the status to 5xx (server error)".to_string(),
+        ));
+    }
+    if probe.status_class != base.status_class {
+        return Some((
+            "info".to_string(),
+            format!(
+                "input changed the status class {}xx -> {}xx",
+                base.status_class, probe.status_class
+            ),
+        ));
+    }
+    let diff = base.len.abs_diff(probe.len);
+    let bigger = base.len.max(probe.len).max(1);
+    if diff > 512 && diff * 100 / bigger >= 30 {
+        return Some((
+            "info".to_string(),
+            format!(
+                "input changed the response length markedly ({} -> {} bytes)",
+                base.len, probe.len
+            ),
+        ));
+    }
+    None
+}
+
+/// The curated, benign fuzz payload set (bounded - the long string is one 1 KiB
+/// request for length-handling observation, never a flood).
+fn fuzz_payloads() -> Vec<String> {
+    let mut v: Vec<String> = [
+        "'",
+        "\"",
+        "\\",
+        "<x>",
+        "../",
+        "%00",
+        "-1",
+        "0",
+        "2147483648",
+        "1e309",
+        "[]",
+        "{}",
+        "null",
+        "true",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for s in SSTI_PAYLOADS {
+        v.push((*s).to_string());
+    }
+    v.push("A".repeat(1024));
+    v
+}
+
+/// Fuzz each URL's query parameters with the curated payload set, reporting at
+/// most one SSTI candidate and one response anomaly per parameter. GET only,
+/// deduped, capped, rate-limited. Non-destructive and bounded (never a flood).
+pub fn fuzz_scan(
+    urls: &[String],
+    timeout: Duration,
+    delay: Duration,
+    max_probes: usize,
+    extra: &[(String, String)],
+) -> Vec<Finding> {
+    let payloads = fuzz_payloads();
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut probes = 0usize;
+    for url in urls {
+        let params = query_params(url);
+        if params.is_empty() {
+            continue;
+        }
+        let base = match fetch(url, timeout, extra) {
+            Ok(r) => shape_of(r.status, &r.body),
+            Err(_) => continue,
+        };
+        for (i, (name, value)) in params.iter().enumerate() {
+            let path = url.split('?').next().unwrap_or(url);
+            if !seen.insert(format!("{path}\u{1}{name}\u{1}fuzz")) {
+                continue;
+            }
+            let decoded = pct_decode(value);
+            let mut ssti_reported = false;
+            let mut anomaly_reported = false;
+            for payload in &payloads {
+                if probes >= max_probes {
+                    return out;
+                }
+                std::thread::sleep(delay);
+                probes += 1;
+                let u = set_param(url, i, &format!("{decoded}{payload}"));
+                let r = match fetch(&u, timeout, extra) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if !ssti_reported && detect_ssti(&r.body) {
+                    out.push(
+                        Finding::new(
+                            "web",
+                            "high",
+                            url.clone(),
+                            "Template injection (SSTI) candidate",
+                        )
+                        .detail(format!(
+                            "parameter `{name}` evaluated a template expression \
+                             (`1337*1337` -> {SSTI_PRODUCT})"
+                        )),
+                    );
+                    ssti_reported = true;
+                    continue;
+                }
+                if !anomaly_reported {
+                    if let Some((sev, detail)) =
+                        classify_anomaly(&base, &shape_of(r.status, &r.body))
+                    {
+                        out.push(
+                            Finding::new("web", &sev, url.clone(), "Input anomaly (fuzz)")
+                                .detail(format!("parameter `{name}`: {detail}")),
+                        );
+                        anomaly_reported = true;
+                    }
+                }
+                if ssti_reported && anomaly_reported {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+// Common parameter names for hidden-parameter discovery (a small wordlist).
+const PARAM_WORDLIST: &[&str] = &[
+    "debug", "test", "admin", "id", "page", "q", "search", "file", "path", "url", "redirect",
+    "lang", "view", "action", "user", "token", "key", "callback", "format", "mode", "show",
+    "preview", "source", "template", "include",
+];
+
+/// Append `name=value` (value percent-encoded) to a URL's query.
+pub fn add_param(url: &str, name: &str, value: &str) -> String {
+    let (base, frag) = match url.split_once('#') {
+        Some((b, f)) => (b.to_string(), format!("#{f}")),
+        None => (url.to_string(), String::new()),
+    };
+    let sep = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{sep}{name}={}{frag}", pct_encode(value))
+}
+
+/// Discover hidden parameters: try a small wordlist with a unique sentinel and
+/// report a name that reflects or changes the response against the baseline.
+/// One pass per path, capped, rate-limited. Non-destructive.
+pub fn hidden_param_scan(
+    urls: &[String],
+    timeout: Duration,
+    delay: Duration,
+    max_probes: usize,
+    extra: &[(String, String)],
+) -> Vec<Finding> {
+    let sentinel = unique_token("sanctumhp");
+    let mut out = Vec::new();
+    let mut seen_path: HashSet<String> = HashSet::new();
+    let mut probes = 0usize;
+    for url in urls {
+        let path = url.split('?').next().unwrap_or(url).to_string();
+        if !seen_path.insert(path) {
+            continue; // probe each distinct path once
+        }
+        let base = match fetch(url, timeout, extra) {
+            Ok(r) => shape_of(r.status, &r.body),
+            Err(_) => continue,
+        };
+        let existing: HashSet<String> = query_params(url).into_iter().map(|(n, _)| n).collect();
+        for cand in PARAM_WORDLIST {
+            if probes >= max_probes {
+                return out;
+            }
+            if existing.contains(*cand) {
+                continue;
+            }
+            std::thread::sleep(delay);
+            probes += 1;
+            let u = add_param(url, cand, &sentinel);
+            if let Ok(r) = fetch(&u, timeout, extra) {
+                if r.body.contains(&sentinel) {
+                    out.push(
+                        Finding::new(
+                            "web",
+                            "info",
+                            url.clone(),
+                            "Hidden parameter candidate (reflected)",
+                        )
+                        .detail(format!("parameter `{cand}` is reflected in the response")),
+                    );
+                } else if shape_of(r.status, &r.body).status_class != base.status_class {
+                    out.push(
+                        Finding::new(
+                            "web",
+                            "info",
+                            url.clone(),
+                            "Hidden parameter candidate (behavioral)",
+                        )
+                        .detail(format!(
+                            "parameter `{cand}` changed the status class vs the baseline"
+                        )),
+                    );
+                }
+            }
         }
     }
     out
@@ -1204,5 +1776,125 @@ mod tests {
             ]),
         );
         assert_eq!(titles(&fs), vec!["HTTP response".to_string()]);
+    }
+
+    #[test]
+    fn destructive_links_are_recognized() {
+        assert!(is_destructive_link("https://ex.com/account/logout"));
+        assert!(is_destructive_link(
+            "https://ex.com/post?action=delete&id=5"
+        ));
+        assert!(is_destructive_link("https://ex.com/users/remove/3"));
+        assert!(!is_destructive_link("https://ex.com/articles/42"));
+        assert!(!is_destructive_link("https://ex.com/search?q=hello"));
+    }
+
+    #[test]
+    fn command_payloads_only_sleep() {
+        // Every command-injection payload must be a delay only - never a
+        // destructive command.
+        for p in cmd_time_payloads() {
+            let low = p.to_ascii_lowercase();
+            assert!(
+                low.contains("sleep") || low.contains("ping") || low.contains("timeout"),
+                "payload must be benign delay only: {p}"
+            );
+            for bad in [
+                "rm ", "del ", "cat ", "curl", "wget", "nc ", "mkfifo", ">", "whoami",
+            ] {
+                assert!(!low.contains(bad), "payload must not contain `{bad}`: {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn traversal_signature_matches_structure_only() {
+        assert_eq!(
+            traversal_signature("root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:"),
+            Some("unix passwd structure")
+        );
+        assert_eq!(
+            traversal_signature("; for 16-bit app support\n[extensions]\n"),
+            Some("windows win.ini structure")
+        );
+        // A page that merely talks about files is not a match.
+        assert_eq!(
+            traversal_signature("Welcome to /etc/passwd documentation"),
+            None
+        );
+        assert_eq!(traversal_signature("nothing structural here"), None);
+    }
+
+    #[test]
+    fn injected_header_detection() {
+        assert!(response_has_injected_header(&h(&[(
+            "x-sanctum-inject",
+            "1"
+        )])));
+        assert!(!response_has_injected_header(&h(&[(
+            "x-sanctum-inject",
+            "2"
+        )])));
+        assert!(!response_has_injected_header(&h(&[(
+            "content-type",
+            "text/html"
+        )])));
+    }
+
+    #[test]
+    fn ssti_product_is_specific() {
+        assert!(detect_ssti("output is 1787569 here"));
+        assert!(!detect_ssti("the answer is 49"));
+        assert!(!detect_ssti("{{1337*1337}}")); // unevaluated input is not a hit
+    }
+
+    #[test]
+    fn anomaly_classification_ranks_by_severity() {
+        let base = shape_of(200, "a normal page of some length");
+        // A new DB error is the strongest signal.
+        assert_eq!(
+            classify_anomaly(
+                &base,
+                &shape_of(200, "You have an error in your SQL syntax")
+            )
+            .unwrap()
+            .0,
+            "high"
+        );
+        // A 500 on input is medium.
+        assert_eq!(
+            classify_anomaly(&base, &shape_of(500, "err")).unwrap().0,
+            "medium"
+        );
+        // A different status class (not 5xx) is info.
+        assert_eq!(
+            classify_anomaly(&base, &shape_of(404, "x")).unwrap().0,
+            "info"
+        );
+        // A large length change is info.
+        assert_eq!(
+            classify_anomaly(&base, &shape_of(200, &"z".repeat(4096)))
+                .unwrap()
+                .0,
+            "info"
+        );
+        // Same shape -> no anomaly.
+        assert!(classify_anomaly(&base, &shape_of(200, "a normal page of some length")).is_none());
+    }
+
+    #[test]
+    fn add_param_appends_to_query() {
+        assert_eq!(
+            add_param("https://ex.com/p", "id", "9"),
+            "https://ex.com/p?id=9"
+        );
+        assert_eq!(
+            add_param("https://ex.com/p?a=1", "id", "9"),
+            "https://ex.com/p?a=1&id=9"
+        );
+        assert_eq!(
+            add_param("https://ex.com/p?a=1#frag", "id", "x y"),
+            "https://ex.com/p?a=1&id=x%20y#frag"
+        );
     }
 }

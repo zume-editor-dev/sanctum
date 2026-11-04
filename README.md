@@ -18,7 +18,7 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
 > pass `--i-am-authorized`. Reconnaissance against systems without permission may
 > be illegal. You are responsible for staying in scope.
 
-## What it does (v0.18)
+## What it does (v0.19)
 
 - **Tier T1 — active recon** (`--scope`, opt-in, scope-limited): TCP **connect**
   host discovery and port enumeration. Connect scans only — no raw sockets, no
@@ -98,12 +98,36 @@ contains no attack code. See the editor's design note `PENTEST_COMPANION_DESIGN.
   small set of **sensitive paths** (`.git/HEAD`, `.env`, backups, `server-status`,
   …) at the origin root (v0.18). Separately, **CSRF-token presence** is checked
   **passively** (always): a POST form with no apparent hidden token field is
-  flagged.
+  flagged. `--active` also covers (v0.19, ADR 0002, all **existence only**): **OS
+  command injection** (a *benign* bounded `sleep` payload delays the response,
+  confirmed twice — nothing harmful runs and no output is read), **path traversal**
+  (a traversal payload returns a well-known *structural, non-secret* signature —
+  the shape of a `root:x:0:0:` line or a `win.ini` marker — confirming the flaw;
+  **file contents are never read or shown**), and **CRLF / HTTP response-header
+  injection** (an injected CR LF makes an inert marker header come back in the
+  response).
+- **Tier T2 — non-destructive fuzzing** (`--web … --fuzz`, v0.19, ADR 0002):
+  **bounded** input mutation that reports response **anomalies** — a `5xx` on
+  input, a new DB error, a marked length change, or a **template expression that
+  evaluates** (SSTI existence: `1337*1337` → `1787569`) — plus **hidden-parameter
+  discovery** from a small wordlist (a name that reflects a sentinel or changes
+  the response). It is explicitly **not** crash/DoS fuzzing: no concurrency, a
+  small payload set, a bounded (1 KiB) longest input, the shared probe cap, and a
+  rate limit, so it cannot act as a flood; it never aims to crash the target.
+- **Tier T2 — authenticated scanning** (`--web … --auth-cookie <V>` /
+  `--auth-header "Name: Value"`, v0.19, ADR 0002): runs the checks inside **your
+  own** session. You supply the `Cookie` value / extra headers (e.g. a bearer
+  token); sanctum **never logs in, brute-forces or derives credentials**, and the
+  session material is a **secret — never written to the audit log, the result
+  JSON or stderr** (only *that* auth was supplied is audited). An authenticated
+  crawl additionally **skips destructive-looking links** (logout / delete /
+  remove / …) so a GET never logs the session out or trips a state change — a
+  guard that hardens anonymous crawls too.
 - Emits **result format v1** JSON that the editor lists and can act on.
 
 Exploitation, payload / shellcode generation, C2, data extraction (e.g. sqlmap
-`--dump`), authentication-bypass execution, WAF evasion, brute-force and DoS are
-**not** goals and are out of scope (ADR 0001).
+`--dump`), authentication-bypass execution, WAF evasion, brute-force and
+DoS / fuzzing-for-crash are **not** goals and are out of scope (ADR 0001 / 0002).
 
 ## Detection matrix
 
@@ -148,6 +172,12 @@ connect host discovery, port enumeration and banner grabbing. Web diagnostics
 | Reflected input (`--active`) | a query parameter reflected but HTML-encoded | info |
 | SQLi error-based (`--active`) | a single quote surfaces a DB error (MySQL / MSSQL / PostgreSQL / Oracle / SQLite) | high |
 | SQLi time-based (`--active`) | a bounded sleep payload delays the response (confirmed twice) | high |
+| Command injection (`--active`) | a benign bounded `sleep` payload delays the response (confirmed twice); existence only | high |
+| Path traversal (`--active`) | a traversal payload returns a structural, non-secret signature (passwd / win.ini shape); contents never shown | high |
+| CRLF injection (`--active`) | an injected CR LF makes an inert marker header appear in the response | high |
+| Template injection / SSTI (`--fuzz`) | a template expression evaluates (`1337*1337` → `1787569`) | high |
+| Input anomaly (`--fuzz`) | an input flips the status class, surfaces a DB error, or changes the length markedly | high / medium / info |
+| Hidden parameter (`--fuzz`) | a wordlist parameter reflects a sentinel or changes the response vs baseline | info |
 | Open redirect (`--active`) | a redirect parameter sends a 3xx Location to an external canary | high |
 | Method enumeration (`--active`) | OPTIONS `Allow` methods; TRACE advertised | info / medium |
 | Sensitive paths (`--active`) | `.git/HEAD`, `.env`, backups, `server-status`, … reachable at the root | high / medium / info |
@@ -193,6 +223,12 @@ sanctum --file ./suspect.bin --json out.json
 
 # Non-destructive web diagnostics of one authorized URL:
 sanctum --web https://app.example.com/ --json out.json --i-am-authorized
+
+# Crawl + active detection + non-destructive fuzzing, as an authenticated user
+# (you supply your own session; it is never logged or written to the result):
+sanctum --web https://app.example.com/ --crawl --active --fuzz \
+        --auth-cookie "session=<your-session-value>" \
+        --json out.json --i-am-authorized
 ```
 
 In Zume, configure a second analyzer for files (its `{target}` is a path):
